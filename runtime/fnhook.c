@@ -96,11 +96,15 @@ void rt_fnhook_set_build(int build) {
     for (int i = 0; i < n; i++) reg(regs[i].addr, regs[i].fn, regs[i].user);
 }
 
+// (Every game function's entry passes here: the table first - bypass only ever names a hooked function, and the
+// thread-local read cost every call)
 int rt_fnhook(Cpu *c, uint64_t addr) {
-    if (bypass == addr) { bypass = 0; return 0; }
     uint32_t s = (uint32_t)((addr >> 2) * 0x9E3779B1u) & (NHOOK - 1);
     while (hooks[s].addr) {
-        if (hooks[s].addr == addr) return hooks[s].fn(c, addr);
+        if (hooks[s].addr == addr) {
+            if (bypass == addr) { bypass = 0; return 0; }
+            return hooks[s].fn(c, addr);
+        }
         s = (s + 1) & (NHOOK - 1);
     }
     return 0;
@@ -124,6 +128,7 @@ void rt_call_original(Cpu *c, uint64_t addr) {
         if (lo < *md->count && md->addrs[lo] == addr) {
             bypass = addr;
             md->fns[lo](c);
+            bypass = 0;  // (a function with no hook never took it: rt_fnhook reads it only on a hooked address)
             return;
         }
     }

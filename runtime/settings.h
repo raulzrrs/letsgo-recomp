@@ -38,15 +38,19 @@ typedef struct {
     float saturation;
     int ssao_level;       // FX_*: SSAO quality (default off); ssao and its parameters follow it
     int gi_level;         // FX_*: GI quality (default off); gi and its parameters follow it
+    bool fx_custom;       // the SSAO / contact shadow / GI parameters below set by hand (F12 Advanced, saved): the levels
+                          // then only turn the SSAO and the GI on and off, the contact shadows have a switch of their own
     bool ssao;            // screen-space ambient occlusion on the game's HDR scene (F12 menu; runtime/nvn/vulkan/exec.c)
-    int ssao_samples;     // per pixel: 8 / 12 / 16
-    float ssao_intensity; // 0..3 (default 2)
-    float ssao_radius;    // in the game's world units (~cm): 10..400 (default 100)
+    int ssao_samples;     // per pixel: 4 / 6 / 8 (low / medium / high)
+    float ssao_intensity; // 0..3 (default 1.2)
+    float ssao_radius;    // in the game's world units (~cm): 10..400 (default 240)
     bool ssao_temporal;   // accumulated over frames along the camera motion vectors (exec.c ssao_run)
     bool contact_on;      // (settings_apply_levels: SSAO ultra) short rays toward the sun in the depth: small objects'
                           // shadows the shadow map misses (exec.c contact_run)
-    int contact_steps;    // ... their steps along a ray (8)
-    float contact_strength;  // ... and how dark (0.375)
+    int contact_steps;    // ... their steps along a ray: 4..32 (6)
+    float contact_strength;  // ... how dark: 0..1 (0.35)
+    float contact_length; // ... the rays' length in world units: 10..200 (100)
+    float contact_thickness;  // ... how far behind the depth a step still counts as a hit: 5..100 (30)
     bool ssao_debug;      // (not saved) the scene shows the occlusion alone
     bool mv_debug;        // (not saved) the scene shows its camera motion vectors (runtime/nvn/vulkan/exec.c scene_hook)
     bool mv_objects;      // per-object motion vectors (characters' own motion) when motion vectors are in use (default on)

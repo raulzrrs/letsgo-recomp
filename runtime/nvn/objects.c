@@ -116,7 +116,33 @@ NVN(nvnQueueSubmitCommands) {
     for (int i = 0; i < n; i++) rt_submit(handles[i]);
 }
 NVN(nvnQueueFlush) { (void)c; }
-NVN(nvnQueueFinish) { (void)c; rt_drain(); renderer_sync(); }
+// The game's frame loop (main+0x29eec in Pikachu 1.0.0) finishes the queue - waits until the GPU is idle - when the GPU
+// time it measured for the last frame (its two ReportCounters, ns) was under 4 ms:
+//     fdiv d0, d0, d1 (/ 1e6)   fmov d1, #4.0   fcmp d0, d1   b.pl <skip>   mov x0, x20   bl <QueueFinish wrapper>
+// At 4 ms or more it goes on without it and relies on its fences (the console's own path). With the render thread
+// a finish waits for the queued lists to be translated and then for the GPU: the game thread, the render thread and
+// the GPU ran in series every frame (the counters measure our translation time, always under 4 ms: it finished every
+// frame, ~4.4 ms of waiting, and the render thread made the game slower than running the backend on the game thread).
+// With the thread on, that call takes the 4 ms path: Pallet Town with no effects, unlimited fps, 145 -> 307 fps (the
+// thread off: 204); paced 30 / 60 fps unchanged. Recognised by its instructions (the return address and the four
+// before the call), not by an address: the same in every build. LARECOMP_FRAME_FINISH=1 keeps the finish.
+static bool frame_loop_finish(uint64_t lr) {
+    static int keep = -1;
+    if (keep < 0) keep = getenv("LARECOMP_FRAME_FINISH") ? atoi(getenv("LARECOMP_FRAME_FINISH")) != 0 : 0;
+    if (keep || !rt_active() || lr < 0x14) return false;
+    static uint64_t known;  // (the call site, once recognised)
+    if (lr == known) return true;
+    const uint32_t *w = (const uint32_t *)(uintptr_t)(lr - 0x14);
+    if (w[0] != 0x1e621001u || w[1] != 0x1e612000u || w[2] != 0x54000065u || w[3] != 0xaa1403e0u) return false;
+    if (!known) LOG("[nvn] the frame loop's queue finish (%llx) follows the game's slow-GPU path (render thread)\n", (unsigned long long)lr);
+    known = lr;
+    return true;
+}
+NVN(nvnQueueFinish) {
+    if (frame_loop_finish(c->x[30])) return;
+    rt_drain();
+    renderer_sync();
+}
 
 static NvnSync *sync_of(uint64_t guest) {
     NvnSync *s = HOST(NvnSync, guest);
@@ -130,6 +156,78 @@ NVN(nvnQueueFenceSync) {
     s->signaled = 1;
     if (rt_active()) { s->seq = 0; s->ticket = rt_fence_ticket(); }  // (the jobs queued so far; the GPU seq is theirs once they have run)
     else { s->ticket = 0; s->seq = renderer_fence_seq(); }
+}
+// Fences recorded inside command lists (nvnCommandBufferFenceSync), by list (its handle: the first record's address).
+// With the render thread a list runs later than the game submits it, and the game waits on these fences before it
+// reuses what the list reads (its constants, its vertex data): the sync takes the ticket of the job that runs the list
+// when it is submitted (rt_submit), so nvnSyncWait waits for that job and its GPU work, no more. Without the render
+// thread the list runs inside the submit and its CMD_FENCE_SYNC sets the GPU submission on the spot (exec.c).
+#define FL_N 512
+#define FL_SYNCS 16
+static struct { uint64_t list; int n; uint64_t sync[FL_SYNCS]; } fl[FL_N];
+static pthread_mutex_t fl_lock = PTHREAD_MUTEX_INITIALIZER;
+static int fl_slot(uint64_t list, bool add) {  // (holds fl_lock) -1: none
+    uint32_t h = (uint32_t)((list >> 3) * 0x9E3779B1u) & (FL_N - 1);
+    for (int k = 0; k < FL_N; k++, h = (h + 1) & (FL_N - 1)) {
+        if (fl[h].list == list) return (int)h;
+        if (!fl[h].list) {
+            if (!add) return -1;
+            fl[h].list = list, fl[h].n = 0;
+            return (int)h;
+        }
+    }
+    if (add) {  // (full: start over - the lists recorded long ago have run)
+        memset(fl, 0, sizeof fl);
+        return fl_slot(list, true);
+    }
+    return -1;
+}
+static void fl_add(int i, uint64_t sync) {
+    for (int k = 0; k < fl[i].n; k++) if (fl[i].sync[k] == sync) return;
+    if (fl[i].n < FL_SYNCS) fl[i].sync[fl[i].n++] = sync;
+    else {
+        static bool warned;
+        if (!warned) { warned = true; LOG("[nvn] a command list holds more than %d fences: the rest wait as before\n", FL_SYNCS); }
+    }
+}
+void nvn_list_begin(uint64_t list) {
+    if (!rt_active()) return;
+    pthread_mutex_lock(&fl_lock);
+    int i = fl_slot(list, false);
+    if (i >= 0) fl[i].n = 0;  // (the memory holds another list now)
+    pthread_mutex_unlock(&fl_lock);
+}
+void nvn_list_fence(uint64_t list, uint64_t sync) {
+    if (!rt_active() || !list || !sync) return;
+    pthread_mutex_lock(&fl_lock);
+    fl_add(fl_slot(list, true), sync);
+    pthread_mutex_unlock(&fl_lock);
+}
+void nvn_list_call(uint64_t list, const uint64_t *called, int n) {
+    if (!rt_active() || !list || !called) return;
+    pthread_mutex_lock(&fl_lock);
+    for (int k = 0; k < n; k++) {
+        int j = fl_slot(called[k], false);
+        if (j < 0 || !fl[j].n) continue;
+        uint64_t s[FL_SYNCS];
+        int m = fl[j].n;
+        memcpy(s, fl[j].sync, sizeof s);
+        int i = fl_slot(list, true);
+        for (int q = 0; q < m; q++) fl_add(i, s[q]);
+    }
+    pthread_mutex_unlock(&fl_lock);
+}
+static NvnSync *sync_of(uint64_t guest);
+void nvn_list_submitted(uint64_t list, uint64_t ticket) {
+    if (!ticket) return;
+    pthread_mutex_lock(&fl_lock);
+    int i = fl_slot(list, false);
+    if (i >= 0)
+        for (int k = 0; k < fl[i].n; k++) {
+            NvnSync *s = sync_of(fl[i].sync[k]);
+            s->signaled = 1, s->seq = 0, s->ticket = ticket;
+        }
+    pthread_mutex_unlock(&fl_lock);
 }
 void nvn_sync_set_seq(uint64_t guest, uint64_t seq) { NvnSync *s = sync_of(guest); s->signaled = 1; s->ticket = 0; s->seq = seq; }  // (a fence inside a list: runs on the render thread)
 NVN(nvnQueueWaitSync) { RET(1); }

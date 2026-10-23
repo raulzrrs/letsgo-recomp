@@ -40,6 +40,10 @@ bool input_finger_cursor(float *x, float *y, bool *down);  // runtime/hle/input.
 static std::atomic<bool> g_open{false};  // the "close the game?" question is up
 static std::atomic<bool> g_cfg{false};   // the F12 settings are up
 static int g_cfg_tab;                    // the F12 settings' tab: graphics, image and sound, advanced (render thread)
+// Ctrl (the controller's top face button: Y on Xbox, X on Nintendo) in the F12 settings: half the size, in the bottom
+// right corner, no darkening of the game - to tune the effects seeing most of the image. Hidden: not in the prompts.
+// (LARECOMP_MENU_SMALL=1: so from the start, for screenshots)
+static bool g_cfg_small = getenv("LARECOMP_MENU_SMALL") != NULL;
 static std::atomic<bool> g_want_fullscreen_apply{false};
 
 struct QEvent {
@@ -453,10 +457,17 @@ static void description(ImDrawList *dl, ImVec2 a, ImVec2 b, float pad_y, const c
 // B / Esc / F12 close; L / R on a controller change the tab. The look of the game's Options screen: the title and the
 // tabs, the description box, the settings as pills, the button prompts on a white strip at the bottom.
 static void cfg_draw(ImGuiIO &io, float scale) {
-    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 70));
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    // (small: scale is already half the window's - menu_render; the margin a fortieth of the window's height)
+    float margin = roundf(io.DisplaySize.y * 0.025f);
+    if (!g_cfg_small) {
+        ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 70));
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    } else {
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - margin, io.DisplaySize.y - margin), ImGuiCond_Always, ImVec2(1, 1));
+    }
     // one size for every tab (a page taller than it scrolls; pad navigation follows)
     float ww = fminf(io.DisplaySize.x * 0.92f, 1120 * scale), wh = fminf(io.DisplaySize.y * 0.92f, 900 * scale);
+    if (g_cfg_small) ww = fminf(ww, io.DisplaySize.x * 0.5f - margin), wh = fminf(wh, io.DisplaySize.y * 0.5f - margin);
     ImGui::SetNextWindowSize(ImVec2(ww, wh), ImGuiCond_Always);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, 0);
     ImGui::Begin("##cfg", NULL, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
@@ -532,6 +543,9 @@ static void cfg_draw(ImGuiIO &io, float scale) {
 
     // the strip: L / R change the tab, B closes (Esc / F12 on a keyboard); a click on Close closes too
     bool close = !popup && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false);
+    if (!popup && (ImGui::IsKeyPressed(ImGuiKey_LeftCtrl, false) || ImGui::IsKeyPressed(ImGuiKey_RightCtrl, false) ||
+                   ImGui::IsKeyPressed(ImGuiKey_GamepadFaceUp, false)))
+        g_cfg_small = !g_cfg_small;
     {
         ImVec2 a(wp.x, wp.y + ws.y - strip), b(wp.x + ws.x, wp.y + ws.y);
         dl->AddRectFilled(a, b, IM_COL32(255, 255, 255, 245), st.WindowRounding, ImDrawFlags_RoundCornersBottom);
@@ -579,7 +593,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     drain_events(io);
     // fonts are built for a ~1080 px tall output; scale to the window (spacing / rounding too)
     static UiScaler scaler;
-    float scale = ui_scale(scaler, (float)target_h);
+    float scale = ui_scale(scaler, (float)target_h * (cfg && !open && g_cfg_small ? 0.5f : 1.0f));
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
 

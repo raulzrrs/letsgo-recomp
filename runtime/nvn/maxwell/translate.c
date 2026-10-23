@@ -15,12 +15,16 @@
 #include <malloc.h>  // alloca
 #endif
 #include <ctype.h>
+#include <pthread.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include <sys/stat.h>
+
+#include "platform.h"  // (mkdir)
 #include "shader.h"
 
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
@@ -2042,7 +2046,21 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     return info;
 }
 
-ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
+// The program's end: the last EXIT followed by self-branch padding, or n words
+static size_t code_end(const uint8_t *code, size_t n) {
+    if (n > 65536) n = 65536;
+    size_t end = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t w = ((const uint64_t *)code)[i];
+        if (i % 4 == 0) continue;
+        if ((w & 0xfff0000000000000ull) == 0xe240000000000000ull && sbits(w, 20, 24) == -8 && end) break;  // bra self
+        if (w == 0 && i > 4) break;
+        end = i + 1;
+    }
+    return end;
+}
+
+static ShaderInfo *translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
     ShaderInfo *info = calloc(1, sizeof *info);
     info->stage = stage;
     Ctx *c = calloc(1, sizeof *c);
@@ -2059,17 +2077,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         c->omap_target = *(const uint32_t *)(sph + 0x48);
         c->omap_depth = (*(const uint32_t *)(sph + 0x4C) >> 1) & 1;
     }
-    // find the end: the last EXIT followed by self-branch padding, or max_size
-    size_t n = (max_size - (code - blob)) / 8;
-    if (n > 65536) n = 65536;
-    size_t end = 0;
-    for (size_t i = 0; i < n; i++) {
-        uint64_t w = ((const uint64_t *)code)[i];
-        if (i % 4 == 0) continue;
-        if ((w & 0xfff0000000000000ull) == 0xe240000000000000ull && sbits(w, 20, 24) == -8 && end) break;  // bra self
-        if (w == 0 && i > 4) break;
-        end = i + 1;
-    }
+    size_t end = code_end(code, (max_size - (code - blob)) / 8);
     // collect branch targets (labels)
     uint8_t *label = calloc(end + 4, 1);
     label[1] = 1;
@@ -2265,6 +2273,203 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     info->out_mask = stage == STAGE_FRAGMENT ? c->omap_target : c->out_attr_mask;
     free(c->body.buf);
     free(c);
+    return info;
+}
+
+// ---------------------------------------------------------- GLSL disk cache
+// Entering the world translates ~370 different programs (~1190 translations: programs share their shaders): ~1 s of
+// CPU on the workers before their SPIR-V (cached on its own: vulkan/shaders.c) could even be looked up. cache/glsl.pak
+// keeps each translation's ShaderInfo and source, found again by a key of everything the output depends on: the
+// program's bytes (headers + instructions up to its end), the stage, the ShaderKey's fields, the heap's base and size
+// (in the global memory code) and the research switches the translator reads (LARECOMP_NO_DISCARD,
+// LARECOMP_VK_EXACT_H2F). The translator itself is the pak's: its header names the time this file was compiled, and a
+// pak of another build is started again (a new build is cold once). One file, appended to: a file per translation
+// (as cache/spirv) cost ~4.6 ms each to write on Windows (its scanner), the cold run 2.7 s of translation instead of
+// 1.0, and the files just written were slow to read in the next run too.
+// Each record holds a second hash of its key (a collision of the first) and a checksum of itself, checked on every
+// read; the pak is read up to its first bad record (a crash mid-write, a garbled file) and cut there, so the programs
+// after it are translated and written again. Failed translations are not stored. Off with LARECOMP_GLSL_CACHE=0; not
+// used for the debug outputs (LARECOMP_SAVE_MSL, maxwell_dbg_*).
+#define GLC_PAK "cache/glsl.pak"
+#define GLC_MAGIC 0x31434c47u  // "GLC1": a record
+#define GLC_HEAD_MAGIC 0x504c4347u  // "GCLP": the pak
+static const char glc_build[32] = __DATE__ " " __TIME__;
+enum { GLC_REC = 4 + 4 + 8 + 8 + (int)sizeof(ShaderInfo), GLC_HEAD = 4 + 4 + 32 };  // record: magic, source length, h, h2, info
+static pthread_mutex_t glc_lock = PTHREAD_MUTEX_INITIALIZER;
+static FILE *glc_f;   // the pak, read and appended to (NULL: none - it could not be made)
+static bool glc_opened;
+static struct GlcSlot { uint64_t h; long off; } *glc_tab;  // open addressing on h (0: empty)
+static size_t glc_cap, glc_n;
+_Atomic unsigned maxwell_glc_hits, maxwell_glc_stores;
+
+static void glc_mix(uint64_t h[2], const void *d, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        uint8_t b = ((const uint8_t *)d)[i];
+        h[0] = (h[0] ^ b) * 0x100000001B3ull;
+        h[1] = (h[1] ^ b) * 0x100000001B3ull + (h[1] >> 29);  // (another hash: the record's check)
+    }
+}
+static uint64_t glc_sum(const uint8_t *d, size_t n) {
+    uint64_t h = 0x84222325cbf29ce4ull;
+    for (size_t i = 0; i < n; i++) h = (h ^ d[i]) * 0x100000001B3ull;
+    return h;
+}
+static struct GlcSlot *glc_find(uint64_t h) {
+    if (!glc_cap) return NULL;
+    for (size_t i = h & (glc_cap - 1);; i = (i + 1) & (glc_cap - 1))
+        if (glc_tab[i].h == h || !glc_tab[i].h) return &glc_tab[i];
+}
+static void glc_add(uint64_t h, long off) {
+    if (!h) h = 1;
+    if ((glc_n + 1) * 2 > glc_cap) {
+        struct GlcSlot *old = glc_tab;
+        size_t oc = glc_cap;
+        glc_cap = glc_cap ? glc_cap * 2 : 1024;
+        glc_tab = calloc(glc_cap, sizeof *glc_tab);
+        glc_n = 0;
+        for (size_t i = 0; i < oc; i++) if (old[i].h) glc_add(old[i].h, old[i].off);
+        free(old);
+    }
+    struct GlcSlot *s = glc_find(h);
+    if (!s->h) glc_n++;
+    s->h = h, s->off = off;
+}
+// A record at d (n bytes left): its length, or 0 when it is not a whole, sound record
+static size_t glc_check(const uint8_t *d, size_t n) {
+    uint32_t mg, ml;
+    if (n < GLC_REC + 8) return 0;
+    memcpy(&mg, d, 4), memcpy(&ml, d + 4, 4);
+    if (mg != GLC_MAGIC || ml == 0 || ml > (8u << 20) || (size_t)GLC_REC + ml + 8 > n) return 0;
+    uint64_t sum;
+    memcpy(&sum, d + GLC_REC + ml, 8);
+    return sum == glc_sum(d, GLC_REC + ml) ? GLC_REC + ml + 8 : 0;
+}
+// (under glc_lock) the pak read in: its records indexed; a pak of another build, or none, made anew; one with a bad
+// record cut before it
+static void glc_open(void) {
+    glc_opened = true;
+    uint8_t *d = NULL;
+    long n = 0;
+    FILE *f = fopen(GLC_PAK, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        d = n > 0 ? malloc((size_t)n) : NULL;
+        if (!d || fread(d, 1, (size_t)n, f) != (size_t)n) n = 0;
+        fclose(f);
+    }
+    uint32_t mg = 0, sz = 0;
+    if (n >= GLC_HEAD) memcpy(&mg, d, 4), memcpy(&sz, d + 4, 4);
+    size_t good = 0;
+    if (mg == GLC_HEAD_MAGIC && sz == sizeof(ShaderInfo) && !memcmp(d + 8, glc_build, sizeof glc_build)) {
+        good = GLC_HEAD;
+        for (size_t r; (r = glc_check(d + good, (size_t)n - good)); good += r) {
+            uint64_t h;
+            memcpy(&h, d + good + 8, 8);
+            glc_add(h, (long)good);
+        }
+    }
+    if (good != (size_t)n || !good) {  // (written again: the header, the sound records)
+        if (!good) {
+            good = GLC_HEAD;
+            d = realloc(d, good);
+            mg = GLC_HEAD_MAGIC, sz = sizeof(ShaderInfo);
+            memcpy(d, &mg, 4), memcpy(d + 4, &sz, 4), memcpy(d + 8, glc_build, sizeof glc_build);
+        }
+        mkdir("cache", 0755);
+        if ((f = fopen(GLC_PAK ".tmp", "wb"))) {
+            bool ok = fwrite(d, 1, good, f) == good;
+            fclose(f);
+            if (ok) remove(GLC_PAK);  // (Windows' rename does not replace)
+            if (!ok || rename(GLC_PAK ".tmp", GLC_PAK) != 0) remove(GLC_PAK ".tmp");
+        }
+        if (n) fprintf(stderr, "[glsl] %s: %s, %zu translations kept\n", GLC_PAK, n < GLC_HEAD || mg != GLC_HEAD_MAGIC || good == GLC_HEAD ?
+                   "another build's (or unreadable): started again" : "cut at a bad record", glc_n);
+    }
+    free(d);
+    glc_f = fopen(GLC_PAK, "a+b");
+}
+
+ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
+    static int on = -1;
+    if (on < 0) on = !getenv("LARECOMP_GLSL_CACHE") || atoi(getenv("LARECOMP_GLSL_CACHE")) != 0;
+    if (!on || !key || !key->glsl || getenv("LARECOMP_SAVE_MSL") || maxwell_dbg_code || maxwell_dbg_vs)
+        return translate(blob, max_size, stage, key);
+    const uint8_t *code = stage == STAGE_COMPUTE ? blob : blob + 0x80;
+    size_t len = (size_t)(code - blob) + code_end(code, (max_size - (code - blob)) / 8) * 8;
+    uint64_t h[2] = {0xcbf29ce484222325ull, 0x9e3779b97f4a7c15ull};
+    uint32_t meta[8] = {(uint32_t)stage, (uint32_t)len, key->vs_out_mask, (uint32_t)(getenv("LARECOMP_NO_DISCARD") != NULL),
+                        (uint32_t)(getenv("LARECOMP_VK_EXACT_H2F") && atoi(getenv("LARECOMP_VK_EXACT_H2F")) != 0)};
+    uint8_t kb[48] = {key->depth_minus_one, key->flip_y, key->glsl, key->velocity, key->vel_vs, key->vel_rt, key->jitter};
+    memcpy(kb + 8, key->attr_kind, 32);
+    memcpy(kb + 40, key->rt_kind, 8);
+    uint64_t heap[2] = {maxwell_gmem_base, maxwell_gmem_size};
+    glc_mix(h, meta, sizeof meta);
+    glc_mix(h, kb, sizeof kb);
+    glc_mix(h, heap, sizeof heap);
+    glc_mix(h, blob, len);
+    if (!h[0]) h[0] = 1;  // (0: an empty slot)
+    pthread_mutex_lock(&glc_lock);
+    if (!glc_opened) glc_open();
+    struct GlcSlot *sl = glc_find(h[0]);
+    bool bad = false;  // (a record for it that did not read back: written again)
+    if (glc_f && sl && sl->h) {
+        uint8_t fix[GLC_REC];
+        uint32_t ml = 0;
+        uint8_t *d = NULL;
+        if (fseek(glc_f, sl->off, SEEK_SET) == 0 && fread(fix, 1, GLC_REC, glc_f) == GLC_REC) {
+            memcpy(&ml, fix + 4, 4);
+            d = ml <= (8u << 20) ? malloc(GLC_REC + ml + 8) : NULL;
+            if (d) {
+                memcpy(d, fix, GLC_REC);
+                if (fread(d + GLC_REC, 1, ml + 8, glc_f) != ml + 8) free(d), d = NULL;
+            }
+        }
+        pthread_mutex_unlock(&glc_lock);
+        uint64_t h2 = 0;
+        if (d && glc_check(d, GLC_REC + ml + 8)) memcpy(&h2, d + 16, 8);
+        if (h2 == h[1]) {
+            ShaderInfo *info = malloc(sizeof *info);
+            memcpy(info, d + 24, sizeof *info);
+            info->msl = malloc(ml + 1);
+            memcpy(info->msl, d + GLC_REC, ml);
+            info->msl[ml] = 0;
+            if (info->stage == stage && !memchr(info->msl, 0, ml)) {
+                free(d);
+                maxwell_glc_hits++;
+                return info;
+            }
+            maxwell_free(info);
+        }
+        free(d);  // (garbled since it was read in, or another key: translated, and the record replaced below)
+        bad = true;
+    } else {
+        pthread_mutex_unlock(&glc_lock);
+    }
+    ShaderInfo *info = translate(blob, max_size, stage, key);
+    if (!info->msl) return info;
+    uint32_t ml = (uint32_t)strlen(info->msl), mg = GLC_MAGIC;
+    size_t n = GLC_REC + ml + 8;
+    uint8_t *d = malloc(n);
+    ShaderInfo copy = *info;
+    copy.msl = NULL;
+    memcpy(d, &mg, 4), memcpy(d + 4, &ml, 4), memcpy(d + 8, &h[0], 8), memcpy(d + 16, &h[1], 8);
+    memcpy(d + 24, &copy, sizeof copy);
+    memcpy(d + GLC_REC, info->msl, ml);
+    uint64_t sum = glc_sum(d, GLC_REC + ml);
+    memcpy(d + GLC_REC + ml, &sum, 8);
+    pthread_mutex_lock(&glc_lock);
+    sl = glc_find(h[0]);
+    if (glc_f && fseek(glc_f, 0, SEEK_END) == 0) {  // (another worker may have stored it meanwhile: once is enough)
+        long off = ftell(glc_f);
+        if ((!sl || !sl->h || bad) && fwrite(d, 1, n, glc_f) == n && fflush(glc_f) == 0) {
+            glc_add(h[0], off);
+            maxwell_glc_stores++;
+        }
+    }
+    pthread_mutex_unlock(&glc_lock);
+    free(d);
     return info;
 }
 

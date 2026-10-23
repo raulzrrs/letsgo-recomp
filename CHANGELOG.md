@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+- **Up to twice the frame rate when the CPU is the limit** (no frame limit, or a slower CPU): with the render thread
+  the game finished its GPU queue every frame - it does when its measured GPU time is under 4 ms, and our counters
+  always were - so the game, the render thread and the GPU ran one after another (the render thread even made it
+  slower than without it). That call now takes the game's own path for a slower GPU. Pallet Town, 4K with no
+  effects, unlimited: 145 -> 307 fps; the menu 140 -> 300; walking 8.5 -> 5.0 ms a frame. 30 / 60 / 120 fps and frame
+  generation pace exactly as before. `LARECOMP_FRAME_FINISH=1` brings the old wait back. Also: fences recorded inside
+  command lists were never set (the condition was read as the sync; unused by Let's Go), and the game's indirect calls
+  are ~1.5 % cheaper.
+- **Cheaper GI**: the indirect light traces against a depth and normals at its own (reduced) size, the depth as 16 bits
+  of log distance, instead of scattered reads over the full-size depth; the normals are rebuilt only at the GI's pixels
+  (they were a full-size pass). 4K, RTX 5070 Ti, Pallet Town: GI high 1.24 -> 0.95 ms a frame, GI low 0.48 -> 0.36; the
+  image the same (its debug view differs from before no more than two runs of the old build differ from each other).
+  Sharing the SSAO's normals with it was tried and dropped: a full-size normal pass for both cost 0.125 ms and saved the
+  SSAO nothing, and its seam handling breaks the GI's light into dark speckles on foliage.
+- `LARECOMP_GPUPROF_AT`: each of our passes has a row of its own (the "SSAO" row was the motion vectors and the "GI" row
+  included the SSAO), the GI is split into trace / blur / composite, and the frame's last pass (FSR 3.1, the present) is
+  shown.
+- **Shorter loads: the shaders' translation is cached on disk** (`cache/glsl.pak`, next to the SPIR-V cache that already
+  skipped the compile after it). Entering the world translated ~370 programs every time: ~1.0 s of CPU on the shader
+  workers, now 0.1 s from the second visit on (0.37 s the first time: programs share shaders), and fewer draws wait
+  for their shader (Pallet Town, 1512 -> 1228 skipped while loading). Kept per build (a new version starts it again)
+  and checked on every read: a garbled or cut file is translated again where it went bad, never used.
+  `LARECOMP_GLSL_CACHE=0` turns it off.
+- **F12 Advanced: the effects' parameters by hand**, applied live: SSAO radius, intensity, samples and accumulation;
+  contact shadows on / off (with any SSAO level), their length, strength, steps and thickness; GI intensity, reach,
+  thickness, rays, steps, resolution and accumulation. The sliders start from the quality level's values; moving one
+  turns *Custom parameters* on, and from then on the levels only turn SSAO and GI on and off. Saved in `larecomp.ini`
+  (`fx_custom = 1` and the values); *Level values* (or *Reset*) goes back to the levels'.
+- **F12 menu: Ctrl (or the controller's Y / X, the top face button) makes it small** - half the size, in the bottom
+  right corner, without darkening the game - so the effects can be tuned while seeing most of the image; again brings
+  it back. Not shown among the button prompts.
+- **SSAO retuned, and cheaper**: a wider reach at a lighter intensity (radius 100 -> 240, intensity 2 -> 1.2) with
+  fewer samples (high 16 -> 8, medium 12 -> 6, low 8 -> 4); Ultra's contact shadows reach farther in fewer steps
+  (60 -> 100 units, 8 -> 6 steps, strength 38 -> 35 %). 4K, Pallet Town: SSAO high 2.40 -> 1.46 ms, medium 1.94 ->
+  1.21, low 1.61 -> 0.97; contact shadows 0.54 -> 0.53.
+- **Title screen: no contact shadows** (SSAO Ultra): on its close-up of Pikachu they drew the shadows of its own arms
+  onto its chest as jagged dark triangles. They are made for the world's scale (feet, grass, small props).
+
 ## 0.6.0 (2026-10-22)
 
 Iván Serrano's ([@Vancete](https://github.com/Vancete), PRs #17 and #19): the in-house frame generation, SSAO Ultra,

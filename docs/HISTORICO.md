@@ -489,3 +489,38 @@ código em `runtime/hle/wildbattle.c`; opção "Batalhas selvagens (experimental
   rastreada testada só na NVIDIA: na 0.6.0 o rastreio (e com ele o cache) só liga sozinho quando o adaptador de vídeo
   principal é NVIDIA (`EnumDisplayDevices`, antes de o Vulkan existir); nas outras placas `LARECOMP_WRITE_WATCH=1` liga,
   e o log diz se ficou ligado. Numa placa que recuse a importação, o log mostra "guest heap import failed".
+
+## O Finish de cada quadro: a thread de renderização deixava o jogo mais lento (23/10/2026)
+
+- **Sintoma.** Sem limite de fps e com a GPU folgada (efeitos desligados, ou 4K com só SMAA), o jogo andava mais
+  devagar com a thread de renderização do que sem ela: Pallet Town (Pikachu) 122 fps ligada contra 179 desligada,
+  3 + 3 rodadas intercaladas. O contrário do que o item 59 mediu em Pewter.
+- **Diagnóstico.** Amostragem das threads (ponteiro de instrução e endereços de retorno na pilha): nenhuma thread
+  saturada (render 31-39 %, as três do jogo 21-31 %), todas esperando umas pelas outras. Contadores temporários no
+  `nvnSyncWait` / `nvnQueueFinish`: um `nvnQueueFinish` por quadro, ~4,4 ms cada (esvaziar a fila da thread de
+  renderização e depois esperar a GPU). Chamado sempre do mesmo ponto do laço de quadros do jogo (Pikachu
+  `main+0x29eec`): `fdiv d0, d0, 1e6` / `fmov d1, #4.0` / `fcmp` / `b.pl` - o jogo só chama o Finish quando o tempo de GPU
+  que ele mediu no quadro anterior (os dois `ReportCounter`, em ns) ficou abaixo de 4 ms. Os contadores medem o nosso
+  tempo de tradução, sempre abaixo de 4 ms: Finish em todo quadro, e jogo, thread de renderização e GPU em série.
+- **Correção.** Com a thread de renderização, esse Finish segue o caminho que o próprio jogo usa quando a GPU leva
+  4 ms ou mais (sem Finish; os fences dele continuam valendo). O ponto é reconhecido pelas instruções (endereço de
+  retorno e as quatro antes da chamada; padrão único no `main`), não por endereço. Os outros Finish (o mesmo laço
+  chama outro quando o modo de vídeo muda) não mudam. `LARECOMP_FRAME_FINISH=1` volta ao antigo.
+- **De passagem.** `CMD_FENCE_SYNC` (fence gravado numa lista) lia `x[1]` (a condição, sempre 0) em vez de `x[0]` (o
+  sync): esses fences nunca eram marcados. Corrigido; com a thread de renderização o sync recebe, quando a lista é
+  enviada, o ticket do trabalho que a executa (`nvn_list_*`, `objects.c`), e o `nvnSyncWait` espera só esse trabalho.
+  O Let's Go não usa fences em listas (as esperas sem fence são do sync do `nvnWindowAcquireTexture`): sem efeito aqui.
+  `rt_dispatch` (chamadas indiretas do jogo): a busca lenta saiu da função, que salvava 5 registradores e montava a
+  pilha em todo acerto do cache; `rt_fnhook` olha a tabela de ganchos antes da variável por thread. +1,5 % (4 + 4).
+- **Medido** (RTX 5070 Ti, 4K tela cheia, sem efeitos: `aa = off`, SSAO / GI / blur / sombras suaves desligados;
+  sem limite de fps, rodadas intercaladas, mesmo save copiado): Pallet Town parado 145 -> 307-313 fps (3 + 3 e 4 + 4), menu
+  aberto 140 -> 300, rota até a Rota 1 147 -> 260, andando em Pallet Town tempo médio por quadro 8,5 -> 5,0 ms (P95 8,4 ->
+  4,7); sem thread de renderização 204 -> 211. Com limite: 30, 60 e 120 fps e geração de quadros x2 com o mesmo ritmo e
+  P95/P99 da build anterior. Imagens dentro da variação entre duas rodadas da mesma build (PSNR 29-36 dB contra
+  27-33); captura completa de um Pidgey na Rota 1 sem defeito.
+- **Agora.** Com a thread de renderização ~50-70 % ocupada, o limite são as três threads do jogo (código recompilado
+  ~87 % do tempo ativo delas). A função mais pesada, `f_7000608b30` (Pikachu), ~13 %: busca linear por hash que
+  recalcula o FNV-1a do nome de cada candidato, byte a byte - o algoritmo do próprio jogo. `rt_fnhook` (todo início de
+  função, porque sempre há ganchos) ~4 % e `rt_dispatch` ~3 %: baixá-los exige mudar o `FN_ENTER` e recompilar o
+  código do jogo. Compilar o código do jogo com -O2 não muda nada: o `zig cc` do jogador gera objetos idênticos com
+  -O1, -O2 e -O3.

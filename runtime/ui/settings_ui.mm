@@ -650,19 +650,133 @@ void ui_page_image_sound(void) {
 }
 
 // ------------------------------------------------------------------ advanced
-// The motion vectors' detail and the debug views (shown at the present instead of the game image: exec.c post_process)
+// The motion vectors' detail, the effects' parameters by hand and the debug views (shown at the present instead of the
+// game image: exec.c post_process).
+// The parameters (runtime/settings.c settings_apply_levels): the sliders show the quality levels' values; moving any of
+// them turns "Custom parameters" on with the values as they are, so the levels then only turn the SSAO and the GI on
+// and off (and the contact shadows have their own switch). Applied live, saved with fx_custom.
+static bool adv_slider(const char *label, float x, const char *id, float *v, float lo, float hi, const char *fmt, float step,
+                       const char *tip) {
+    ui_row(label, x);
+    bool ch = ui_slider(id, v, lo, hi, fmt, step);
+    ui_tip(tip);
+    return ch;
+}
+static bool adv_islider(const char *label, float x, const char *id, int *v, int lo, int hi, const char *tip) {
+    float f = (float)*v;
+    if (!adv_slider(label, x, id, &f, (float)lo, (float)hi, "%.0f", 1, tip)) return false;
+    int n = (int)lroundf(f);
+    if (n == *v) return false;
+    *v = n;
+    return true;
+}
+static bool adv_toggle(const char *label, float x, const char *id, bool *v, const char *tip) {
+    bool ch = ui_toggle(id, label, x, v);
+    ui_tip(tip);
+    return ch;
+}
+
 void ui_page_advanced(void) {
+    const char *l_rad = UI_T("Radius", "Raio", "Радиус"), *l_int = UI_T("Intensity", "Intensidade", "Интенсивность"),
+               *l_smp = UI_T("Samples", "Amostras", "Выборки"), *l_tmp = UI_T("Temporal", "Temporal", "Временное"),
+               *l_cs = UI_T("Contact shadows", "Sombras de contato", "Контактные тени"),
+               *l_len = UI_T("Length", "Comprimento", "Длина"), *l_str = UI_T("Strength", "Força", "Сила"),
+               *l_stp = UI_T("Steps", "Passos", "Шаги"), *l_thk = UI_T("Thickness", "Espessura", "Толщина"),
+               *l_ray = UI_T("Rays", "Raios", "Лучи"), *l_res = UI_T("Resolution", "Resolução", "Разрешение"),
+               *l_cus = UI_T("Custom parameters", "Parâmetros próprios", "Свои параметры");
     const char *l[] = {UI_T("Per-object motion vectors", "Vetores de movimento por objeto", "Векторы движения объектов"),
                        UI_T("Occlusion alone", "Só a oclusão", "Только затенение"),
                        UI_T("Indirect light alone", "Só a luz indireta", "Только непрямой свет"),
-                       UI_T("Motion vectors", "Vetores de movimento", "Векторы движения")};
-    float x = ui_label_x(l, 4);
+                       UI_T("Motion vectors", "Vetores de movimento", "Векторы движения"),
+                       l_rad, l_int, l_smp, l_tmp, l_cs, l_len, l_str, l_stp, l_thk, l_ray, l_res, l_cus};
+    float x = ui_label_x(l, 16);
     ui_toggle("##mv_objects", l[0], x, &g_settings.mv_objects);
     ui_tip(UI_T("The motion of each object, not only the camera's, for TAA, FSR 3.1 and the frame generation.",
                 "O movimento de cada objeto, não só o da câmera, para o TAA, o FSR 3.1 e a geração de quadros.",
                 "Движение каждого объекта, а не только камеры, для TAA, FSR 3.1 и генерации кадров."));
+
+    // ---- the effects' parameters
+    ui_heading(UI_T("Effect tuning", "Ajuste dos efeitos", "Настройка эффектов"));
+    Settings &S = g_settings;
+    bool ch = false;
+    ui_toggle("##fx_custom", l_cus, x, &S.fx_custom);
+    ui_tip(UI_T("Off: the quality levels set the values below. On: yours, saved; the levels only turn the effects on and off.",
+                "Desligado: os níveis de qualidade definem os valores abaixo. Ligado: os seus, salvos; os níveis só ligam e desligam os efeitos.",
+                "Выкл.: значения ниже задают уровни качества. Вкл.: ваши, сохраняются; уровни только включают и выключают эффекты."));
+    ui_heading("SSAO");
+    ImGui::PushID("ssao");
+    ImGui::BeginDisabled(!S.ssao);
+    ch |= adv_slider(l_rad, x, "##r", &S.ssao_radius, 10, 400, "%.0f", 10,
+                     UI_T("How far the occlusion reaches, in world units (~cm). Level: 240.", "Até onde a oclusão alcança, em unidades do mundo (~cm). Nível: 240.",
+                          "Дальность затенения в единицах мира (~см). Уровень: 240."));
+    ch |= adv_slider(l_int, x, "##i", &S.ssao_intensity, 0, 3, "%.2f", 0.1f,
+                     UI_T("How dark it gets. Level: 1.2.", "O quanto escurece. Nível: 1,2.", "Насколько темнее. Уровень: 1,2."));
+    ch |= adv_islider(l_smp, x, "##s", &S.ssao_samples, 4, 32,
+                      UI_T("Per pixel: more is smoother and slower. Levels: 4 / 6 / 8.", "Por pixel: mais é mais suave e mais lento. Níveis: 4 / 6 / 8.",
+                           "На пиксель: больше — глаже и медленнее. Уровни: 4 / 6 / 8."));
+    ch |= adv_toggle(l_tmp, x, "##t", &S.ssao_temporal,
+                     UI_T("Accumulated over frames: less noise, a little trailing.", "Acumulada ao longo dos quadros: menos ruído, um pouco de rastro.",
+                          "Накопление по кадрам: меньше шума, лёгкий шлейф."));
+    ImGui::EndDisabled();
+    ImGui::PopID();
+    ui_heading(l_cs);
+    ImGui::PushID("contact");
+    ch |= adv_toggle(l_cs, x, "##on", &S.contact_on,
+                     UI_T("Short rays toward the sun: small objects' shadows the shadow map misses. Level: SSAO Ultra.",
+                          "Raios curtos rumo ao sol: as sombras de objetos pequenos que o mapa de sombras perde. Nível: SSAO Ultra.",
+                          "Короткие лучи к солнцу: тени мелких объектов, которых нет на карте теней. Уровень: SSAO Ultra."));
+    ImGui::BeginDisabled(!S.contact_on);
+    ch |= adv_slider(l_len, x, "##l", &S.contact_length, 10, 200, "%.0f", 5,
+                     UI_T("The rays' length in world units. Level: 100.", "O comprimento dos raios em unidades do mundo. Nível: 100.",
+                          "Длина лучей в единицах мира. Уровень: 100."));
+    float pct = S.contact_strength * 100;
+    if (adv_slider(l_str, x, "##st", &pct, 0, 100, "%.0f%%", 5,
+                   UI_T("How dark the shadows are. Level: 35%.", "O quanto as sombras escurecem. Nível: 35%.", "Насколько темны тени. Уровень: 35%.")))
+        S.contact_strength = pct / 100, ch = true;
+    ch |= adv_islider(l_stp, x, "##sp", &S.contact_steps, 4, 32,
+                      UI_T("Depth checks per ray. Level: 6.", "Testes de profundidade por raio. Nível: 6.", "Проверок глубины на луч. Уровень: 6."));
+    ch |= adv_slider(l_thk, x, "##th", &S.contact_thickness, 5, 100, "%.0f", 5,
+                     UI_T("How far behind a surface still casts. Level: 30.", "Até que profundidade atrás de uma superfície ainda faz sombra. Nível: 30.",
+                          "На какой глубине за поверхностью ещё есть тень. Уровень: 30."));
+    ImGui::EndDisabled();
+    ImGui::PopID();
+    ui_heading(UI_T("Indirect light (GI)", "Luz indireta (GI)", "Непрямой свет (GI)"));
+    ImGui::PushID("gi");
+    ImGui::BeginDisabled(!S.gi);
+    ch |= adv_slider(l_int, x, "##i", &S.gi_intensity, 0, 4, "%.2f", 0.1f,
+                     UI_T("How much bounced light. Level: 2.", "Quanta luz refletida. Nível: 2.", "Сколько отражённого света. Уровень: 2."));
+    ch |= adv_slider(l_rad, x, "##r", &S.gi_radius, 50, 1000, "%.0f", 25,
+                     UI_T("How far the rays reach, in world units. Level: 300.", "Até onde os raios alcançam, em unidades do mundo. Nível: 300.",
+                          "Дальность лучей в единицах мира. Уровень: 300."));
+    ch |= adv_slider(l_thk, x, "##th", &S.gi_thickness, 5, 100, "%.0f", 5,
+                     UI_T("How thick surfaces are taken to be for a hit. Level: 25.", "A espessura que se supõe nas superfícies para um acerto. Nível: 25.",
+                          "Какой считать толщину поверхности для попадания. Уровень: 25."));
+    ch |= adv_islider(l_ray, x, "##ry", &S.gi_rays, 1, 8,
+                      UI_T("Per GI pixel. Levels: 2 / 3 / 4.", "Por pixel do GI. Níveis: 2 / 3 / 4.", "На пиксель GI. Уровни: 2 / 3 / 4."));
+    ch |= adv_islider(l_stp, x, "##sp", &S.gi_steps, 4, 32,
+                      UI_T("Depth checks per ray. Levels: 6 / 6 / 8.", "Testes de profundidade por raio. Níveis: 6 / 6 / 8.",
+                           "Проверок глубины на луч. Уровни: 6 / 6 / 8."));
+    {
+        const char *dv[] = {"1/2", "1/3", "1/4"};
+        int d = S.gi_div - 2;
+        ui_row(l_res, x);
+        if (ui_combo("##div", &d, dv, 3)) S.gi_div = d + 2, ch = true;
+        ui_tip(UI_T("Of each axis of the scene. Levels: 1/3 low, 1/2 medium and high.", "De cada eixo da cena. Níveis: 1/3 no baixo, 1/2 no médio e no alto.",
+                    "По каждой оси сцены. Уровни: 1/3 низкое, 1/2 среднее и высокое."));
+    }
+    ch |= adv_toggle(l_tmp, x, "##t", &S.gi_temporal,
+                     UI_T("Accumulated over frames: less noise, a little trailing.", "Acumulada ao longo dos quadros: menos ruído, um pouco de rastro.",
+                          "Накопление по кадрам: меньше шума, лёгкий шлейф."));
+    ImGui::EndDisabled();
+    ImGui::PopID();
+    if (ch) S.fx_custom = true;
+    ui_group_gap();
+    if (ui_button(UI_T("Level values", "Valores dos níveis", "Значения уровней"))) S.fx_custom = false;
+    ui_tip(UI_T("Back to the quality levels' values.", "Volta aos valores dos níveis de qualidade.", "Вернуть значения уровней качества."));
+    settings_apply_levels();
+
     ui_heading(UI_T("Debug views", "Vistas de depuração", "Отладка"));
-    ImGui::BeginDisabled(!g_settings.ssao);
+    ImGui::BeginDisabled(!g_settings.ssao && !g_settings.contact_on);
     ui_toggle("##ssao_debug", l[1], x, &g_settings.ssao_debug);
     ImGui::EndDisabled();
     ImGui::BeginDisabled(!g_settings.gi);
@@ -673,5 +787,7 @@ void ui_page_advanced(void) {
     if (ui_button(UI_T("Reset", "Restaurar", "Сбросить"))) {
         g_settings.ssao_debug = g_settings.gi_debug = g_settings.mv_debug = false;
         g_settings.mv_objects = true;
+        g_settings.fx_custom = false;
+        settings_apply_levels();
     }
 }

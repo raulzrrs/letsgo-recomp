@@ -188,11 +188,21 @@ static GuestFn dispatch_slow(Cpu *c) {
     return f;
 }
 
+// A cache miss: the lookup, then the function (a tail call too). Kept out of rt_dispatch: inlined there, its register
+// saves and stack frame were set up on every indirect call, hits included (~7% of the game threads' busy time).
+static __attribute__((noinline)) void dispatch_miss(Cpu *c) {
+    GuestFn f = dispatch_slow(c);
+    __attribute__((musttail)) return f(c);
+}
+
 // Always tail-calls, so chains of indirect jumps don't grow the host stack.
 void rt_dispatch(Cpu *c) {
     unsigned h = (unsigned)(c->pc >> 2) & (DCACHE - 1);
-    GuestFn f = dcache[h].addr == c->pc ? dcache[h].fn : dispatch_slow(c);
-    __attribute__((musttail)) return f(c);
+    if (__builtin_expect(dcache[h].addr == c->pc, 1)) {
+        GuestFn f = dcache[h].fn;
+        __attribute__((musttail)) return f(c);
+    }
+    __attribute__((musttail)) return dispatch_miss(c);
 }
 
 void guest_call(Cpu *c, uint64_t addr) {

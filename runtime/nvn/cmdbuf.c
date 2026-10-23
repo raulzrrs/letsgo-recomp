@@ -119,6 +119,7 @@ NVN(nvnCommandBufferBeginRecording) {
     cb->recording = true;
     rec(c, cb, CMD_BARRIER, 0);  // makes sure memory exists; the list starts here
     cb->start = cb->mem + cb->used - sizeof(CmdRec);
+    nvn_list_begin(cb->start);
 }
 NVN(nvnCommandBufferEndRecording) {
     NvnCmdBuf *cb = cb_of(A(0));
@@ -532,6 +533,7 @@ NVN(nvnCommandBufferFenceSync) {
     // work executes at submit time, so the sync is satisfied once this list has run
     Snap s = snap(c);
     record(c, CMD_FENCE_SYNC, 0, &s);
+    nvn_list_fence(cb_of(s.x[0])->start, s.x[1]);  // (with the render thread: the sync takes the list's ticket at submit)
 }
 PLAIN(nvnCommandBufferWaitSync, CMD_WAIT_SYNC)
 PLAIN(nvnCommandBufferBarrier, CMD_BARRIER)
@@ -551,8 +553,13 @@ NVN(nvnCommandBufferCallCommands) {
                 trace_chain(c);
             }
     }
-    draw_chain(c, "call", A(1)); obj_mark(c, cb_of(A(0))); record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
-NVN(nvnCommandBufferCopyCommands) { obj_mark(c, cb_of(A(0))); record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
+    draw_chain(c, "call", A(1)); obj_mark(c, cb_of(A(0))); record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8);
+    nvn_list_call(cb_of(A(0))->start, (const uint64_t *)(uintptr_t)A(2), (int)A(1));  // (their fences are this list's too)
+}
+NVN(nvnCommandBufferCopyCommands) {
+    obj_mark(c, cb_of(A(0))); record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8);
+    nvn_list_call(cb_of(A(0))->start, (const uint64_t *)(uintptr_t)A(2), (int)A(1));
+}
 NVN(nvnCommandBufferInsertDebugMarker) { (void)c; }
 NVN(nvnCommandBufferInsertDebugMarkerDynamic) { (void)c; }
 NVN(nvnCommandBufferInsertDebugMarkerStatic) { (void)c; }

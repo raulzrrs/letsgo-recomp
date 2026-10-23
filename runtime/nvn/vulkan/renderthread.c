@@ -163,7 +163,7 @@ static uint64_t push(Job j) {
 void rt_submit(uint64_t handle) {
     if (!rt_active()) { backend_execute(handle); return; }
     Job j = {.kind = RJ_EXEC, .handle = handle, .dirty = backend_dirty_seq()};
-    push(j);
+    nvn_list_submitted(handle, push(j));  // (the fences recorded in it: this job's)
 }
 
 // Game thread: the frame's present. The window shows it when the render thread gets there; the game's own bookkeeping that a

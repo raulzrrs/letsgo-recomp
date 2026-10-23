@@ -24,10 +24,14 @@ Settings g_settings = {
     .contrast = 1.0f,
     .saturation = 1.0f,
     .ssao = false,
-    .ssao_intensity = 2.0f,
-    .ssao_radius = 100.0f,
+    .ssao_intensity = 1.2f,
+    .ssao_radius = 240.0f,
     .ssao_temporal = true,
-    .ssao_samples = 16,
+    .ssao_samples = 8,
+    .contact_steps = 6,
+    .contact_strength = 0.35f,
+    .contact_length = 100.0f,
+    .contact_thickness = 30.0f,
     .shadow_filter = SHADOW_SMOOTH,
     .ui2x = true,
     .blur_quality = true,
@@ -78,6 +82,24 @@ static void parse_line(const char *line) {
     else if (!strcmp(key, "ssao")) g_settings.ssao_level = atoi(val) != 0 ? FX_HIGH : FX_OFF;
     else if (!strcmp(key, "ssao_level")) g_settings.ssao_level = atoi(val);
     else if (!strcmp(key, "gi_level")) g_settings.gi_level = atoi(val);
+    // (the parameters by hand: saved with fx_custom only, clamped by settings_apply_levels)
+    else if (!strcmp(key, "fx_custom")) g_settings.fx_custom = atoi(val) != 0;
+    else if (!strcmp(key, "ssao_radius")) g_settings.ssao_radius = (float)atof(val);
+    else if (!strcmp(key, "ssao_intensity")) g_settings.ssao_intensity = (float)atof(val);
+    else if (!strcmp(key, "ssao_samples")) g_settings.ssao_samples = atoi(val);
+    else if (!strcmp(key, "ssao_temporal")) g_settings.ssao_temporal = atoi(val) != 0;
+    else if (!strcmp(key, "contact_shadows")) g_settings.contact_on = atoi(val) != 0;
+    else if (!strcmp(key, "contact_steps")) g_settings.contact_steps = atoi(val);
+    else if (!strcmp(key, "contact_strength")) g_settings.contact_strength = (float)atof(val);
+    else if (!strcmp(key, "contact_length")) g_settings.contact_length = (float)atof(val);
+    else if (!strcmp(key, "contact_thickness")) g_settings.contact_thickness = (float)atof(val);
+    else if (!strcmp(key, "gi_intensity")) g_settings.gi_intensity = (float)atof(val);
+    else if (!strcmp(key, "gi_radius")) g_settings.gi_radius = (float)atof(val);
+    else if (!strcmp(key, "gi_thickness")) g_settings.gi_thickness = (float)atof(val);
+    else if (!strcmp(key, "gi_rays")) g_settings.gi_rays = atoi(val);
+    else if (!strcmp(key, "gi_steps")) g_settings.gi_steps = atoi(val);
+    else if (!strcmp(key, "gi_div")) g_settings.gi_div = atoi(val);
+    else if (!strcmp(key, "gi_temporal")) g_settings.gi_temporal = atoi(val) != 0;
     else if (!strcmp(key, "mv_objects")) g_settings.mv_objects = atoi(val) != 0;
     else if (!strcmp(key, "gi")) g_settings.gi_level = atoi(val) != 0 ? FX_HIGH : FX_OFF;
     else if (!strcmp(key, "gi_debug")) g_settings.gi_debug = atoi(val) != 0;  // (by hand / tests: never saved)
@@ -140,27 +162,51 @@ void settings_clamp_color(void) {
     settings_apply_levels();
 }
 
-// SSAO and GI by level (F12 menu). High: the parameters they had before the levels (SSAO 16 samples; GI 4 rays x 8
-// steps at half the scene's size). Medium and low keep the look (strength, reach, accumulation over frames) with less
-// work: SSAO 12 / 8 samples (the accumulation evens out the noise); GI 3 rays x 6 steps at half the size, 2 x 6 at a
+// SSAO and GI by level (F12 menu). SSAO: a reach of 240 units at intensity 1.2 (the player's tuning on the Advanced
+// page; it was 100 at 2 with 16 / 12 / 8 samples), 8 samples high, 6 medium, 4 low (the accumulation evens out the
+// noise). GI high: the parameters it had before the levels (4 rays x 8 steps at half the scene's size); medium and low
+// keep the look (strength, reach, accumulation over frames) with less work: 3 rays x 6 steps at half the size, 2 x 6 at a
 // third (about 1/2 and 1/6 of high's). The upscaler: FSR 3.1 when it is the anti-aliasing, else bilinear (FSR 1 stays
 // only as FSR 3.1's fallback without its DLL: exec.c post_process).
+// fx_custom (F12 Advanced): the parameters are the player's, kept as they are (into their ranges); the levels turn the
+// SSAO and the GI on and off, and the contact shadows keep their own switch. The sliders start from the level's
+// values: moving one is what turns fx_custom on (runtime/ui/settings_ui.mm), and its reset hands them back.
+static int clampi_(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static float clampr_(float v, float lo, float hi, float def) { return v != v ? def : v < lo ? lo : v > hi ? hi : v; }
 void settings_apply_levels(void) {
     int s = g_settings.ssao_level < FX_OFF || g_settings.ssao_level > FX_ULTRA ? FX_OFF : g_settings.ssao_level;
     int g = g_settings.gi_level < FX_OFF || g_settings.gi_level > FX_HIGH ? FX_OFF : g_settings.gi_level;
     g_settings.ssao_level = s, g_settings.gi_level = g;
-    static const int ssao_samples[] = {16, 8, 12, 16, 16};
     g_settings.ssao = s != FX_OFF;
-    // Ultra: high plus the contact shadows (8 steps, strength 0.375: ~half the GPU time of 16 steps at 0.5)
-    g_settings.contact_on = s == FX_ULTRA;
-    g_settings.contact_steps = 8;
-    g_settings.contact_strength = 0.375f;
-    g_settings.ssao_samples = ssao_samples[s];
-    g_settings.ssao_intensity = 2.0f, g_settings.ssao_radius = 100.0f, g_settings.ssao_temporal = true;
-    static const int gi_rays[] = {4, 2, 3, 4}, gi_steps[] = {8, 6, 6, 8}, gi_div[] = {2, 3, 2, 2};
     g_settings.gi = g != FX_OFF;
-    g_settings.gi_rays = gi_rays[g], g_settings.gi_steps = gi_steps[g], g_settings.gi_div = gi_div[g];
-    g_settings.gi_intensity = 2.0f, g_settings.gi_radius = 300.0f, g_settings.gi_thickness = 25.0f, g_settings.gi_temporal = true;
+    if (g_settings.fx_custom) {
+        g_settings.ssao_samples = clampi_(g_settings.ssao_samples, 4, 32);
+        g_settings.ssao_intensity = clampr_(g_settings.ssao_intensity, 0.0f, 3.0f, 1.2f);
+        g_settings.ssao_radius = clampr_(g_settings.ssao_radius, 10.0f, 400.0f, 240.0f);
+        g_settings.contact_steps = clampi_(g_settings.contact_steps, 4, 32);
+        g_settings.contact_strength = clampr_(g_settings.contact_strength, 0.0f, 1.0f, 0.35f);
+        g_settings.contact_length = clampr_(g_settings.contact_length, 10.0f, 200.0f, 100.0f);
+        g_settings.contact_thickness = clampr_(g_settings.contact_thickness, 5.0f, 100.0f, 30.0f);
+        g_settings.gi_intensity = clampr_(g_settings.gi_intensity, 0.0f, 4.0f, 2.0f);
+        g_settings.gi_radius = clampr_(g_settings.gi_radius, 50.0f, 1000.0f, 300.0f);
+        g_settings.gi_thickness = clampr_(g_settings.gi_thickness, 5.0f, 100.0f, 25.0f);
+        g_settings.gi_rays = clampi_(g_settings.gi_rays, 1, 8);
+        g_settings.gi_steps = clampi_(g_settings.gi_steps, 4, 32);
+        g_settings.gi_div = clampi_(g_settings.gi_div, 2, 4);
+    } else {
+        static const int ssao_samples[] = {8, 4, 6, 8, 8};
+        // Ultra: high plus the contact shadows (the player's tuning: a ray of 100 units in 6 steps, strength 0.35 - it was
+        // 60 in 8 at 0.375 -; a hit within 30 units behind the depth)
+        g_settings.contact_on = s == FX_ULTRA;
+        g_settings.contact_steps = 6;
+        g_settings.contact_strength = 0.35f;
+        g_settings.contact_length = 100.0f, g_settings.contact_thickness = 30.0f;
+        g_settings.ssao_samples = ssao_samples[s];
+        g_settings.ssao_intensity = 1.2f, g_settings.ssao_radius = 240.0f, g_settings.ssao_temporal = true;
+        static const int gi_rays[] = {4, 2, 3, 4}, gi_steps[] = {8, 6, 6, 8}, gi_div[] = {2, 3, 2, 2};
+        g_settings.gi_rays = gi_rays[g], g_settings.gi_steps = gi_steps[g], g_settings.gi_div = gi_div[g];
+        g_settings.gi_intensity = 2.0f, g_settings.gi_radius = 300.0f, g_settings.gi_thickness = 25.0f, g_settings.gi_temporal = true;
+    }
     if (g_settings.antialias < AA_OFF || g_settings.antialias > AA_FSR3) g_settings.antialias = AA_SMAA;
     g_settings.upscaler_pick = UPSCALE_BILINEAR;
     g_settings.upscaler = g_settings.antialias == AA_FSR3 ? UPSCALE_FSR3 : UPSCALE_BILINEAR;
@@ -229,6 +275,17 @@ void settings_save(void) {
     fprintf(f, "saturation = %.2f\n", g_settings.saturation);
     fprintf(f, "ssao_level = %d\n", g_settings.ssao_level);
     fprintf(f, "gi_level = %d\n", g_settings.gi_level);
+    if (g_settings.fx_custom) {  // (else the levels' own: nothing to keep)
+        fprintf(f, "fx_custom = 1\n");
+        fprintf(f, "ssao_radius = %.0f\nssao_intensity = %.2f\nssao_samples = %d\nssao_temporal = %d\n", g_settings.ssao_radius,
+                g_settings.ssao_intensity, g_settings.ssao_samples, g_settings.ssao_temporal);
+        fprintf(f, "contact_shadows = %d\ncontact_steps = %d\ncontact_strength = %.3f\ncontact_length = %.0f\ncontact_thickness = %.0f\n",
+                g_settings.contact_on, g_settings.contact_steps, g_settings.contact_strength, g_settings.contact_length,
+                g_settings.contact_thickness);
+        fprintf(f, "gi_intensity = %.2f\ngi_radius = %.0f\ngi_thickness = %.0f\ngi_rays = %d\ngi_steps = %d\ngi_div = %d\ngi_temporal = %d\n",
+                g_settings.gi_intensity, g_settings.gi_radius, g_settings.gi_thickness, g_settings.gi_rays, g_settings.gi_steps,
+                g_settings.gi_div, g_settings.gi_temporal);
+    }
     fprintf(f, "mv_objects = %d\n", g_settings.mv_objects);
     fprintf(f, "ui2x = %d\n", g_settings.ui2x);
     fprintf(f, "blur_quality = %d\n", g_settings.blur_quality);

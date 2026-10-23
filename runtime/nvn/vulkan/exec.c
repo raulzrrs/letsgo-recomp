@@ -290,6 +290,9 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
         cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->upload};
     }
     vk_cmd();  // (an empty main buffer still carries the semaphores)
+    // (closes the submission's last row: without it the frame's last pass - FSR 3.1, the present, the menus - had no
+    // row of its own; this one's row is the gap until the next submission)
+    gp_mark(s->main, "(submission end; until the next submission)");
     if (s->ts) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
     VK_CHECK(vkEndCommandBuffer(s->main));
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
@@ -1064,6 +1067,12 @@ const char *renderer_stats(void) {
         size_t n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, " | vertex ranges %llu copied, %llu in place", (unsigned long long)stat_vtx_copied, (unsigned long long)stat_vtx_direct);
         stat_vtx_copied = stat_vtx_direct = 0;
+    }
+    {   // (the translations the GLSL disk cache gave, and those it stored: maxwell/translate.c)
+        extern _Atomic unsigned maxwell_glc_hits, maxwell_glc_stores;
+        unsigned gh = atomic_exchange(&maxwell_glc_hits, 0), gs = atomic_exchange(&maxwell_glc_stores, 0);
+        size_t n = strlen(stats_text);
+        if (gh || gs) snprintf(stats_text + n, sizeof stats_text - n, " | glsl cache %u read, %u stored", gh, gs);
     }
     stat_feedback_copies = stat_upload_bytes = stat_shader_wait_ns = 0;
     if (g_exp_count[0] | g_exp_count[1] | g_exp_count[2] | g_exp_count[3]) {
@@ -4470,12 +4479,13 @@ static VkPipeline post_pipeline(const char *fs) { return post_pipeline_ex(fs, VK
 // Post image `i` at w x h (RGBA8, kept until the size changes). 0, 1: SMAA edges / weights, 2: SMAA output,
 // 3, 4: FSR EASU / RCAS, 5: colour adjustment, 6, 7: SSAO (occlusion, blur), 8: motion vectors (RGBA16F),
 // 9: their RGBA8 encoding (LARECOMP_MV_DUMP), 10, 11: SSAO history (RG16F, ping-pong), 12, 13: the debug views,
-// 14-19: GI (normals, work, history, debug: gi_run), 20: the scene pass's velocity target (per-object motion vectors), 21, 22: TAA history, 23: the scene depth as R32F, 24: FSR 3's output (storage), 25: the image
+// 14: (unused), 15-19: GI (work, history, debug: gi_run), 20: the scene pass's velocity target (per-object motion vectors), 21, 22: TAA history, 23: the scene depth as R32F, 24: FSR 3's output (storage), 25: the image
 // before the interface, 26: FSR 3's interface mask, 27: an in-between image's TAA result (its history left as it was),
 // 28, 29: N's SSAO / GI moved to an in-between image, 30: an in-between image resolved against N's FSR 3.1 output,
 // 31: that image sharpened, 32: debanding (the last post pass), 33, 34: contact shadows (mask, blur: contact_run), 35: their
 // debug view, 36: an in-between image with frame N's interface (ip_ui_keep), 37: FSR 3.1's output with the interface
-// composited after it. The in-between images at a reduced size (vk_tex_lo_begin) have a set of their own (48 on):
+// composited after it, 38, 39: the GI-size distance (R16, log2) and normals (gi_run). The in-between images at a
+// reduced size (vk_tex_lo_begin) have a set of their own (48 on):
 // sized for them, they were made again at every switch between a real frame and an in-between image, and the real
 // frames' histories (SSAO, GI, TAA) went with them.
 static TexBackend *post_image_fmt(int i, uint32_t w, uint32_t h, VkFormat fmt) {
@@ -4652,31 +4662,34 @@ static TexBackend *mv_run(VkCommandBuffer cb, VkImageView dv, uint32_t w, uint32
     return mv;
 }
 
-// Screen-space indirect light (F12 GI; shaders.c gi_*), in the scene hook before the occlusion: normals from the depth
-// (post image 14) -> trace at 1 / gi_div of each axis (15) -> blur across (16) -> blur down (15) -> temporal (history
-// 17 / 18, along the camera motion vectors) -> added onto the scene, edge-aware (the debug view: 19, at the present).
+// Screen-space indirect light (F12 GI; shaders.c gi_*), in the scene hook before the occlusion: the depth and the
+// normals (rebuilt from it) taken to 1 / gi_div of each axis (post images 38, 39) -> trace there (15) -> blur across
+// (16) -> blur down (15) -> temporal (history 17 / 18, along the camera motion vectors) -> added onto the scene,
+// edge-aware (the debug view: 19, at the present).
+// (4K, GI high - 1/2, 4 rays x 8 steps -, Pallet Town, RTX 5070 Ti, LARECOMP_GPUPROF_AT medians: 1.24 -> 0.95 ms, of
+// it the trace 0.87 -> 0.63 and depth + normals 0.08 -> 0.04 - a full-size normal pass before, now the GI's pixels
+// only; GI low 0.48 -> 0.36)
 static void gi_run(VkCommandBuffer cb, VkImageView dv, uint32_t w, uint32_t h, float mo, TexBackend *mv, uint64_t fr) {
     gp_mark(cb, "ours: GI %ux%u%s", w, h, ip_replaying ? " (in-between)" : "");
     uint32_t div = (uint32_t)g_settings.gi_div, lw = (w + div - 1) / div, lh = (h + div - 1) / div;
     // (pipelines and images before any rendering begins)
-    VkPipeline p_n = post_pipeline("gi_normal.frag");
+    VkPipeline p_n = post_pipeline("gi_normal.frag"), p_d = post_pipeline_ex("gi_depth.frag", VK_FORMAT_R16_UNORM, 0);
     VkPipeline p_t = post_pipeline_ex("gi_trace.frag", VK_FORMAT_R16G16B16A16_SFLOAT, 0);
     VkPipeline p_b = post_pipeline_ex("gi_blur.frag", VK_FORMAT_R16G16B16A16_SFLOAT, 0);
     VkPipeline p_tm = post_pipeline_ex("gi_temporal.frag", VK_FORMAT_R16G16B16A16_SFLOAT, 0);
     VkPipeline p_c = post_pipeline_ex("gi_composite.frag", ao.cfmt, 3);
     VkPipeline p_dbg = post_pipeline("gi_composite.frag");
-    TexBackend *nrm = post_image(14, w, h);
+    TexBackend *ln = post_image(39, lw, lh), *ld = post_image_fmt(38, lw, lh, VK_FORMAT_R16_UNORM);
     TexBackend *g0 = post_image_fmt(15, lw, lh, VK_FORMAT_R16G16B16A16_SFLOAT), *g1 = post_image_fmt(16, lw, lh, VK_FORMAT_R16G16B16A16_SFLOAT);
     // N's light (the last real frame's) is what an in-between image composites: a side image (vk_interp_replay)
     static TexBackend *gi_last;
     TexBackend *res = gi_last;
     uint64_t rf = renderer_present_count();  // (real frames: the history chains by these)
+    float pn[16] = {ao.proj[0], ao.proj[1], ao.proj[2], ao.proj[3], 0, 0, 0, 0, 0, 0, 0, 0, mo, 0.75f, (float)lw, (float)lh};
     if (ip_replaying) {
         if (!gi_last) return;
-        if (vk_tex_lo_active()) {  // (reduced: N's normals are another size - its own, from its depth)
-            float pn[16] = {ao.proj[0], ao.proj[1], ao.proj[2], ao.proj[3], 0, 0, 0, 0, 0, 0, 0, 0, mo, 0.75f, (float)lw, (float)lh};
-            post_pass_view(cb, p_n, &dv, 1, post_view(nrm), w, h, pn, sizeof pn, false, false);
-        }
+        if (vk_tex_lo_active())  // (reduced: N's normals are another size - its own, from its depth)
+            post_pass_view(cb, p_n, &dv, 1, post_view(ln), lw, lh, pn, sizeof pn, false, false);
         if (mv) {  // (moved to where this image's pixels were in N: post image 29)
             TexBackend *wp = post_image_fmt(29, lw, lh, VK_FORMAT_R16G16B16A16_SFLOAT);
             float pw[8] = {0, 0, 0, 0, 1.0f / (float)lw, 1.0f / (float)lh};
@@ -4688,21 +4701,22 @@ static void gi_run(VkCommandBuffer cb, VkImageView dv, uint32_t w, uint32_t h, f
     } else {
         bool temporal = g_settings.gi_temporal && mv;
         float turn = temporal ? (float)fmod((double)rf * 0.6180339887, 1.0) : 0.0f;
-        float pc[16] = {ao.proj[0], ao.proj[1], ao.proj[2], ao.proj[3],
-                        0, 0, 0, 0,
-                        0, 0, 0, 0,
-                        mo, 0.75f, (float)lw, (float)lh};
-        post_pass_view(cb, p_n, &dv, 1, post_view(nrm), w, h, pc, sizeof pc, false, false);
+        float pc[16];
+        memcpy(pc, pn, sizeof pc);
+        post_pass_view(cb, p_d, &dv, 1, post_view(ld), lw, lh, pc, sizeof pc, false, false);
+        post_pass_view(cb, p_n, &dv, 1, post_view(ln), lw, lh, pc, sizeof pc, false, false);
         // trace: b = radius, thickness, origin bias, max receiver distance (60 m); c = rays, steps, turn, luminance clamp
         pc[4] = g_settings.gi_radius, pc[5] = g_settings.gi_thickness, pc[6] = 3, pc[7] = 6000;
         pc[8] = (float)g_settings.gi_rays, pc[9] = (float)g_settings.gi_steps, pc[10] = turn, pc[11] = GI_LUMA_CLAMP;
-        VkImageView ti[4] = {dv, post_view(nrm), ao.cview};
-        post_pass_view(cb, p_t, ti, 3, post_view(g0), lw, lh, pc, sizeof pc, false, false);
+        VkImageView ti[4] = {post_view(ld), post_view(ln), ao.cview, dv};
+        gp_mark(cb, "ours: GI trace");
+        post_pass_view(cb, p_t, ti, 4, post_view(g0), lw, lh, pc, sizeof pc, false, false);
         float pb[16] = {ao.proj[0], ao.proj[1], ao.proj[2], ao.proj[3], 1, 0, 1, 0, 0, 0, 0, 0, mo, 0, (float)lw, (float)lh};
-        VkImageView bx[4] = {post_view(g0), post_view(nrm)};
+        VkImageView bx[4] = {post_view(g0), post_view(ln)};
+        gp_mark(cb, "ours: GI blur, temporal");
         post_pass_view(cb, p_b, bx, 2, post_view(g1), lw, lh, pb, sizeof pb, false, false);
         pb[4] = 0, pb[5] = 1;
-        VkImageView by[4] = {post_view(g1), post_view(nrm)};
+        VkImageView by[4] = {post_view(g1), post_view(ln)};
         post_pass_view(cb, p_b, by, 2, post_view(g0), lw, lh, pb, sizeof pb, false, false);
         res = g0;
         if (temporal) {  // (no history after a gap, a cut or a change of size)
@@ -4720,11 +4734,12 @@ static void gi_run(VkCommandBuffer cb, VkImageView dv, uint32_t w, uint32_t h, f
         }
         gi_last = res;
     }
+    gp_mark(cb, "ours: GI composite");
     // composite: b.x = intensity x diffuse reflectance (0.5); c.xy = 1 / the output's size
     float strength = g_settings.gi_intensity * 0.5f;
     float pcm[16] = {ao.proj[0], ao.proj[1], ao.proj[2], ao.proj[3], strength, 0, 0, 0,
                      1.0f / (float)ao.cw, 1.0f / (float)ao.ch, 0, 0, mo, 0, (float)lw, (float)lh};
-    VkImageView ci[4] = {post_view(res), dv, post_view(nrm)};
+    VkImageView ci[4] = {dv, post_view(res), post_view(ln)};
     if (g_settings.gi_debug) {  // the light alone (x GI_DEBUG_EXPOSURE, tone mapped), shown at the present
         TexBackend *enc = post_image(19, w, h);
         float pd[16];
@@ -4783,7 +4798,10 @@ static bool sun_dir(uint64_t fr, float out[3]) {
 static void contact_run(VkCommandBuffer cb, VkImageView dv, uint32_t w, uint32_t h, float mo, uint64_t fr) {
     float L[3];
     uint32_t bs = ao.scene_size[ao.scene_cur];
-    if (!sun_dir(fr, L) || ao.poff < 64 || ao.poff > bs) return;
+    // (none on the title screen: its close-up of Pikachu put the shadows of its own arms onto its chest as jagged
+    // triangles - the rays are made for the world's scale, feet and props on the ground: runtime/hle/fps60.c game_title)
+    extern bool game_title(void);
+    if (game_title() || !sun_dir(fr, L) || ao.poff < 64 || ao.poff > bs) return;
     // into the view space the shaders rebuild from the depth (x right, y as the image's rows, z the distance): the
     // camera's rigid view (row-major, the 64 bytes before the projection in the scene block: mv_capture_camera) is GL's,
     // looking down -z, its y the rows' (checked on the shadows alone, ssao_debug: under the player's feet and a lamp's
@@ -4796,10 +4814,10 @@ static void contact_run(VkCommandBuffer cb, VkImageView dv, uint32_t w, uint32_t
     if (!flip) flip = getenv("LARECOMP_CONTACT_FLIP") ? -1.0f : 1.0f;
     if (env_strength == -2) env_strength = getenv("LARECOMP_CONTACT_STRENGTH") ? (float)atof(getenv("LARECOMP_CONTACT_STRENGTH")) : -1;
     float strength = env_strength >= 0 ? env_strength : g_settings.contact_strength;
-    // (a ray of 60 units - the player's feet to the knees -, 16 steps (8 with SSAO ultra: settings_apply_levels); a hit
-    // counts within 30 units behind the depth)
-    float pc[12] = {ao.proj[0], ao.proj[1], ao.proj[2], ao.proj[3], 60.0f, strength, mo, (float)g_settings.contact_steps,
-                    lv[0], flip * lv[1], -lv[2], 30.0f};
+    // (the ray's length, its steps, and how far behind the depth a hit counts: settings_apply_levels - 100 units, 6
+    // steps, 30 units - or the F12 Advanced page's)
+    float pc[12] = {ao.proj[0], ao.proj[1], ao.proj[2], ao.proj[3], g_settings.contact_length, strength, mo,
+                    (float)g_settings.contact_steps, lv[0], flip * lv[1], -lv[2], g_settings.contact_thickness};
     VkPipeline p_c = post_pipeline("contact.frag"), p_blur = post_pipeline("ssao_blur.frag");
     VkPipeline p_apply = post_pipeline_ex("ssao_apply.frag", ao.cfmt, 1);
     TexBackend *m0 = post_image(33, w, h), *m1 = post_image(34, w, h);
@@ -4831,7 +4849,9 @@ static void contact_run(VkCommandBuffer cb, VkImageView dv, uint32_t w, uint32_t
 // indirect light, then the occlusion - from the depth at its size -> blur across -> blur down ->
 // multiplied onto the scene's colour. The debug views replace the colour (the motion vectors' last).
 static void ssao_run(void) {
-    gp_mark(vk_cmd(), "ours: SSAO%s", ip_replaying ? " (in-between)" : "");
+    // (the marks: motion vectors, GI, SSAO, contact shadows, each its own row - the SSAO's used to start here and so
+    // measured the motion vectors, while the GI's row went on through the SSAO: "GI 3.1 ms" was GI + SSAO)
+    gp_mark(vk_cmd(), "ours: camera motion vectors%s", ip_replaying ? " (in-between)" : "");
     uint64_t fr = fx_frame();
     ssao_settle_camera();
     ao.done_frame = fr;
@@ -4847,6 +4867,7 @@ static void ssao_run(void) {
     cb = vk_cmd();  // (a dump submits the command buffer: renderer_save_texture_tex)
     if (g_settings.gi && g_settings.gi_intensity > 0) gi_run(cb, dv, w, h, mo, mv, fr);
     if (g_settings.ssao) {
+        gp_mark(cb, "ours: SSAO%s", ip_replaying ? " (in-between)" : "");
         // (pipelines and images before any rendering begins)
         VkPipeline p_ao = post_pipeline("ssao.frag"), p_blur = post_pipeline("ssao_blur.frag");
         VkPipeline p_apply = post_pipeline_ex("ssao_apply.frag", ao.cfmt, 1);
@@ -5302,9 +5323,9 @@ static VkImageView ip_post_view(TexBackend *b, double ow, double oh);
 void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh, const float pv[8]) {
     if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return;
     double ow = pv[6] > 0 ? vw / pv[6] : vw, oh = pv[7] > 0 ? vh / pv[7] : vh;
-    gp_mark(cb, "ours: present to the window");
     VkImageView src = ip_post_view(b, ow, oh);  // (an image of a present kept until now: processed when it was made)
     if (!src) src = post_process(cb, b, ow, oh);
+    gp_mark(cb, "ours: present to the window, menus");
     VkPipeline p = present_pipeline(g_vk.sc_format);
     VkDescriptorSet ds = vk_alloc_set(present_set_layout);
     VkDescriptorImageInfo ii = {vk_default_sampler(true), src, VK_IMAGE_LAYOUT_GENERAL};
@@ -5533,7 +5554,9 @@ static void exec_list(uint64_t handle, int depth) {
             if (fence_flush < 0) fence_flush = getenv("LARECOMP_FENCE_FLUSH") ? 1 : 0;
             if (fence_flush) renderer_flush();
             extern void nvn_sync_set_seq(uint64_t guest, uint64_t seq);
-            if (r->x[1]) nvn_sync_set_seq(r->x[1], renderer_fence_seq());
+            // (x[0] the sync - x[1] is the condition. With the render thread the sync took this list's ticket when the
+            // game submitted it: objects.c nvn_list_submitted)
+            if (r->x[0] && !rt_on_render_thread()) nvn_sync_set_seq(r->x[0], renderer_fence_seq());
             break;
         }
         case CMD_REPORT_COUNTER: {
