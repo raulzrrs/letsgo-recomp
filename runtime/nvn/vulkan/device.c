@@ -824,6 +824,10 @@ static bool pq_pop_oldest(void) {
     pq_show(&p, false);
     return true;
 }
+// Images presented before their time because the window images held drawn ran out (backend_present): frame generation
+// "Auto" takes them as frames come late (exec.c ip_auto_mult)
+static uint64_t pq_forced;
+uint64_t vk_fg_forced_presents(void) { return pq_forced; }
 static int pq_count(void) {
     pthread_mutex_lock(&pq_lk);
     int n = pq_n;
@@ -992,7 +996,7 @@ void backend_present(NvnTexture *t) {
             // frame's lists: at 4K a fifth of the images reached the screen with the next one (one of the two lost).
             // (Window images held drawn: at most the swapchain's less 3 - beyond, the oldest goes now, or acquiring
             // would wait for a present this thread makes.)
-            while (pq_count() > 0 && pq_count() >= (int)g_vk.sc_count - 3) pq_pop_oldest();
+            while (pq_count() > 0 && pq_count() >= (int)g_vk.sc_count - 3) pq_pop_oldest(), pq_forced++;
             g_defer_present = true, g_deferred_ok = false;
             present_image(img, final, image, nimg, total_frames);
             g_defer_present = false;

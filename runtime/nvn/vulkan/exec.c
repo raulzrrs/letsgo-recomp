@@ -1254,7 +1254,8 @@ static bool mv_wanted(void) {
     static int dump = -1;
     if (dump < 0) dump = getenv("LARECOMP_MV_DUMP") != NULL;
     return g_settings.mv_debug || dump || (g_settings.ssao && g_settings.ssao_temporal) || (g_settings.gi && g_settings.gi_temporal) ||
-           g_settings.antialias == AA_TAA || g_settings.upscaler == UPSCALE_FSR3;
+           g_settings.antialias == AA_TAA || g_settings.upscaler == UPSCALE_FSR3 ||
+           (g_settings.frame_gen && g_settings.fg_method == FG_FLOW);  // (the optical flow starts from them: flow_prepare)
 }
 
 // ================================================================== render passes
@@ -4414,10 +4415,10 @@ static VkPipeline post_pipeline_ex(const char *fs, VkFormat fmt, int blend) {
     static struct { const char *fs; VkFormat fmt; int blend; VkPipeline p; } cache[64];
     for (int i = 0; i < 64; i++) if (cache[i].p && cache[i].fs == fs && cache[i].fmt == fmt && cache[i].blend == blend) return cache[i].p;
     if (!post_layout) {
-        VkDescriptorSetLayoutBinding b[4];
-        for (uint32_t i = 0; i < 4; i++)
+        VkDescriptorSetLayoutBinding b[6];  // (6: the optical flow's in-between image, flow_image)
+        for (uint32_t i = 0; i < 6; i++)
             b[i] = (VkDescriptorSetLayoutBinding){i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
-        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 4, .pBindings = b};
+        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 6, .pBindings = b};
         VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &post_set_layout));
         VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128};  // (32 for most; a matrix: the motion vectors)
         VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
@@ -4547,8 +4548,8 @@ static void post_pass_view(VkCommandBuffer cb, VkPipeline pipe, const VkImageVie
                           .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &ca};
     vkCmdBeginRendering(cb, &ri);
     VkDescriptorSet ds = vk_alloc_set(post_set_layout);
-    VkDescriptorImageInfo ii[4];
-    VkWriteDescriptorSet w[4];
+    VkDescriptorImageInfo ii[6];
+    VkWriteDescriptorSet w[6];
     for (int i = 0; i < n; i++) {
         ii[i] = (VkDescriptorImageInfo){vk_default_sampler(true), srcs[i], VK_IMAGE_LAYOUT_GENERAL};
         w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = (uint32_t)i,
@@ -6710,9 +6711,165 @@ static TexBackend *ip_n_post(double ow, double oh) {
     IpKeep *k = &ip_keep[IP_KEEP_N];
     return k->post_ok && fabs(ow - k->ow) < 0.5 && fabs(oh - k->oh) < 0.5 ? &k->post : NULL;
 }
+// ---- Frame generation by optical flow (fg_method = flow): the in-between images made from N-1's and N's processed
+// images (as they are shown: after FSR 3.1 / TAA / SMAA, the colour pass and the debanding), moved toward the image's
+// time along a motion field - no draw runs again. The field: the motion vectors the renderer has (camera and objects:
+// mv_run), and where they miss what the image does (particles, the geometry the CPU writes, transparency, shadows
+// moving over still ground) an image-based estimate - block matching on the luminance at ~640 wide (flow_match,
+// flow_refine), taken per pixel only where it is clearly better (flow_pick). Then per image (flow_warp.frag): N's
+// pixel that is at q at t, mixed with N-1's where it was unless N-1's depth shows it covered then (N alone); a pixel
+// uncovered since t (covered in N) from N-1 along the background's motion; N's interface as it is (its mask).
+// Post images: 38, 39 N's field (one per keep set: N-1's is the other), 40 its dilation, 41 the luminance, 42, 43 the
+// blocks (matched, refined), 44 the per-pixel pick, 45 the in-between image, 46 it sharpened (flow_sharp.frag).
+// Measured (FSR 3.1 native, SSAO medium, GI high; the walk in the grass, 3x): GPU at 4K 0.90 ms a present (luminance
+// 0.12, matching 0.2, refining 0.1, pick 0.05, field and dilation 0.38) + 0.71 an image: 1.16 ms per in-between image
+// against the re-rendering's 3.90; at 1280 x 720 0.23 against 1.29. Flicker as the re-rendering's (720p: 0.76 / 0.93 %
+// of the blocks at 2x / 3x, re-rendering 0.83 / 0.93), detail within 1.3 % of the real frames (re-rendering +3 - 4 %),
+// 91 % of the moving blocks halfway (the same). Pacing at 240 Hz, 30 fps x 4: 90 % of the intervals right at 4K
+// (re-rendering 39 %), 96.5 % at 720p (76 %).
+// Research: LARECOMP_FLOW_MATCH=0 (the motion vectors alone, no block matching), LARECOMP_FLOW_RADIUS=<pixels of the
+// luminance> (the search, default 4), LARECOMP_FLOW_OCCLUSION=0 (no depth test: N-1 and N always mixed where found),
+// LARECOMP_FLOW_DEBUG=1 (tinted: red the flow's vectors, green N alone, blue N-1 alone).
+static bool flow_on(void) { return g_settings.frame_gen && g_settings.fg_method == FG_FLOW; }
+static struct {
+    TexBackend *img[2];      // N's processed image, per keep set (ip_keep_sets): N-1's is the other set's
+    uint64_t img_real[2];    // (the present it was kept at)
+    uint64_t field_real[2];  // N's field (post image 38 + set) made at that present, and its size
+    uint32_t fw[2], fh[2];
+    bool fp;                 // this present: N-1's field there, the size of N's (the depth test, N-1's interface)
+    float t;                 // the image's time (vk_interp_replay)
+} flow;
+static int flow_set(void) { return ip_keep == ip_keep_sets[1]; }
+// N's kept image noted (re-rendering too: switched to the flow, its first present already has N-1's image)
+static void flow_note_n(void) {
+    int s = flow_set();
+    IpKeep *kn = &ip_keep[IP_KEEP_N];
+    flow.img[s] = kn->post_ok ? &kn->post : NULL, flow.img_real[s] = renderer_present_count();
+}
+static int flow_env(const char *name, int def) { const char *e = getenv(name); return e ? atoi(e) : def; }
+
+// At vk_interp_begin, after N's image was kept: N's field (the next present's N-1 field), and the flow from N-1 when its
+// image is there. False: no in-between images this present (N alone).
+static bool flow_prepare(void) {
+    int s = flow_set();
+    uint64_t real = renderer_present_count(), fr = fx_frame();
+    flow_note_n();  // (only a processed image: deband, at least)
+    TexBackend *c1 = flow.img[s], *c0 = flow.img[!s];
+    if (!c1) return false;
+    bool prev = c0 && c0->image && flow.img_real[!s] + 1 == real && c0->width == c1->width && c0->height == c1->height;
+    TexBackend *d = ao.depth && ao.depth->image && (ao.depth->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && ao.depth->samples <= 1 &&
+                    ao.proj_frame == fr ? ao.depth : NULL;
+    TexBackend *mv = d && ao.done_frame == fr && mv_wanted() ? post_image_fmt(8, d->width, d->height, VK_FORMAT_R16G16B16A16_SFLOAT) : NULL;
+    uint32_t fw = d ? d->width : c1->width, fh = d ? d->height : c1->height;
+    bool mask = ip_ui_mask && ip_ui_mask_real == real;
+    static int match = -1, radius = -1;
+    if (match < 0) match = flow_env("LARECOMP_FLOW_MATCH", 1), radius = flow_env("LARECOMP_FLOW_RADIUS", 4);
+    const VkFormat hf = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkImageView dummy = vk_dummy_view(TEXTYPE_2D);
+    vk_end_pass();
+    extern void vk_frame_suspend(void);
+    extern void vk_frame_resume(void);
+    vk_frame_suspend();
+    VkCommandBuffer cb = vk_cmd();
+    gp_mark(cb, "ours: flow field %ux%u%s", fw, fh, prev ? "" : " (no N-1)");
+    TexBackend *pick = NULL;
+    if (prev && match) {  // (the block matching: N-1's image needed)
+        uint32_t lw = c1->width < 640 ? c1->width : 640, lh = (uint32_t)lround((double)c1->height * lw / c1->width);
+        if (lh < 8) lh = 8;
+        const uint32_t G = 4;
+        uint32_t gw = (lw + G - 1) / G, gh = (lh + G - 1) / G;
+        VkPipeline p_l = post_pipeline_ex("flow_luma.frag", hf, 0), p_m = post_pipeline_ex("flow_match.frag", hf, 0);
+        VkPipeline p_r = post_pipeline_ex("flow_refine.frag", hf, 0), p_p = post_pipeline_ex("flow_pick.frag", hf, 0);
+        TexBackend *L = post_image_fmt(41, lw, lh, hf), *b0 = post_image_fmt(42, gw, gh, hf), *b1 = post_image_fmt(43, gw, gh, hf);
+        pick = post_image_fmt(44, lw, lh, hf);
+        float pl[8] = {1.0f / (float)lw, 1.0f / (float)lh, mask ? 1.0f : 0.0f};
+        VkImageView li[3] = {post_view(c1), post_view(c0), mask ? post_view(ip_ui_mask) : dummy};
+        post_pass_view(cb, p_l, li, 3, post_view(L), lw, lh, pl, 32, false, false);
+        float pm[8] = {1.0f / (float)lw, 1.0f / (float)lh, (float)radius, (float)G, mv ? 1.0f : 0.0f};
+        VkImageView mvv = mv ? post_view(mv) : dummy;
+        VkImageView mi[3] = {post_view(L), mvv, dummy};
+        gp_mark(cb, "ours: flow match %ux%u", gw, gh);
+        post_pass_view(cb, p_m, mi, 3, post_view(b0), gw, gh, pm, 32, false, false);
+        VkImageView ri[3] = {post_view(L), mvv, post_view(b0)};
+        gp_mark(cb, "ours: flow refine");
+        post_pass_view(cb, p_r, ri, 3, post_view(b1), gw, gh, pm, 32, false, false);
+        VkImageView pi[3] = {post_view(L), mvv, post_view(b1)};
+        gp_mark(cb, "ours: flow pick %ux%u", lw, lh);
+        post_pass_view(cb, p_p, pi, 3, post_view(pick), lw, lh, pm, 32, false, false);
+    }
+    VkPipeline p_f = post_pipeline_ex("flow_field.frag", hf, 0), p_d = post_pipeline_ex("flow_dilate.frag", hf, 0);
+    TexBackend *F = post_image_fmt(38 + s, fw, fh, hf), *D = post_image_fmt(40, fw, fh, hf);
+    static const VkComponentMapping id = {0};
+    VkImageView dv = d ? vk_image_view(d, VK_IMAGE_VIEW_TYPE_2D, d->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT) : dummy;
+    float pf[12] = {ao.proj[0], ao.proj[1], ao.proj[2], ao.proj[3], nvn_depth_mode() == 0 ? 1.0f : 0.0f, mv ? 1.0f : 0.0f,
+                    d ? 1.0f : 0.0f, mask ? 1.0f : 0.0f, pick ? 1.0f : 0.0f, 0, (float)fw, (float)fh};
+    VkImageView fi[4] = {mv ? post_view(mv) : dummy, dv, pick ? post_view(pick) : dummy, mask ? post_view(ip_ui_mask) : dummy};
+    gp_mark(cb, "ours: flow field pass");
+    post_pass_view(cb, p_f, fi, 4, post_view(F), fw, fh, pf, sizeof pf, false, false);
+    float pz[8] = {0};
+    VkImageView di[1] = {post_view(F)};
+    gp_mark(cb, "ours: flow dilate");
+    post_pass_view(cb, p_d, di, 1, post_view(D), fw, fh, pz, 32, false, false);
+    vk_post_barrier(cb);
+    vk_frame_resume();
+    flow.field_real[s] = real, flow.fw[s] = fw, flow.fh[s] = fh;
+    flow.fp = flow.field_real[!s] + 1 == real && flow.fw[!s] == fw && flow.fh[!s] == fh;
+    return prev;
+}
+
+// The in-between image at flow.t (flow_warp.frag) kept in slot `slot` as vk_interp_keep keeps a re-rendered one: b
+// (N's presented texture) is only its handle
+static TexBackend *flow_image(TexBackend *b, int slot, bool now) {
+    int s = flow_set();
+    IpKeep *k = &ip_keep[slot], *kn = &ip_keep[IP_KEEP_N];
+    TexBackend *c1 = flow.img[s], *c0 = flow.img[!s];
+    k->post_ok = k->raw_ok = false;
+    k->direct = NULL;
+    const VkFormat hf = VK_FORMAT_R16G16B16A16_SFLOAT;
+    static int occl = -1, dbg = -1;
+    if (occl < 0) occl = flow_env("LARECOMP_FLOW_OCCLUSION", 1), dbg = flow_env("LARECOMP_FLOW_DEBUG", 0);
+    uint32_t w = c1->width, h = c1->height;
+    bool mask = ip_ui_mask && ip_ui_mask_real == renderer_present_count();
+    VkImageView dummy = vk_dummy_view(TEXTYPE_2D);
+    static float sharp = -1;
+    if (sharp < 0) sharp = getenv("LARECOMP_FLOW_SHARP") ? (float)atof(getenv("LARECOMP_FLOW_SHARP")) : 0.2f;
+    VkPipeline p = post_pipeline("flow_warp.frag"), ps = post_pipeline("flow_sharp.frag");
+    TexBackend *out = post_image(45, w, h);
+    TexBackend *F = post_image_fmt(38 + s, flow.fw[s], flow.fh[s], hf), *D = post_image_fmt(40, flow.fw[s], flow.fh[s], hf);
+    TexBackend *Fp = flow.fp ? post_image_fmt(38 + !s, flow.fw[s], flow.fh[s], hf) : NULL;
+    vk_end_pass();
+    extern void vk_frame_suspend(void);
+    extern void vk_frame_resume(void);
+    vk_frame_suspend();
+    VkCommandBuffer cb = vk_cmd();
+    gp_mark(cb, "ours: flow t=%.2f (in-between)", flow.t);
+    float pw[12] = {flow.t, Fp ? 1.0f : 0.0f, mask ? 1.0f : 0.0f, occl ? 1.0f : 0.0f, 1.0f / (float)w, 1.0f / (float)h, 0, 0,
+                    dbg ? 1.0f : 0.0f};
+    VkImageView wi[6] = {post_view(c0), post_view(c1), post_view(F), post_view(D), Fp ? post_view(Fp) : dummy,
+                         mask ? post_view(ip_ui_mask) : dummy};
+    post_pass_view(cb, p, wi, 6, post_view(out), w, h, pw, sizeof pw, false, false);
+    if (sharp > 0) {
+        TexBackend *o2 = post_image(46, w, h);
+        float pz[8] = {sharp};
+        VkImageView si[1] = {post_view(out)};
+        post_pass_view(cb, ps, si, 1, post_view(o2), w, h, pz, 32, false, false);
+        out = o2;
+    }
+    vk_post_barrier(cb);  // (the present's draw samples it; a keep copy waits with a barrier of its own)
+    vk_frame_resume();
+    if (now) k->direct = out;  // (drawn before the next image writes it: no copy)
+    else hold_copy_into(&k->post, out);
+    k->post_ok = true, k->ow = kn->ow, k->oh = kn->oh;
+    if (!k->raw.image || k->raw.width != b->width || k->raw.height != b->height || k->raw.format != b->format) hold_copy_into(&k->raw, b);
+    k->raw.sx = b->sx, k->raw.sy = b->sy, k->raw.scalable = b->scalable;
+    return &k->raw;
+}
+
 // The presented texture b after an in-between image was rendered into it: kept in slot `slot` (0 .. 7) to be shown -
-// now (drawn into the window before the next replay: no copy) or later
+// now (drawn into the window before the next replay: no copy) or later. (Optical flow: made here, flow_image.)
+static bool ip_flow;  // this present's in-between images are the optical flow's (vk_interp_begin)
 TexBackend *vk_interp_keep(TexBackend *b, int slot, bool now) {
+    if (ip_flow) return flow_image(b, slot < 0 ? 0 : slot >= IP_KEEP_N ? IP_KEEP_N - 1 : slot, now);
     TexBackend *r = ip_keep_image(vk_tex_lo(b), slot < 0 ? 0 : slot >= IP_KEEP_N ? IP_KEEP_N - 1 : slot, now);
     vk_tex_lo_end();  // (a reduced image: vk_interp_replay began it)
     return r;
@@ -6772,6 +6929,13 @@ static int ip_auto_mult(uint64_t period) {
     if (vrr < 0) vrr = getenv("LARECOMP_FG_VRR") != NULL;
     double hz = env_hz > 0 ? env_hz : vk_display_hz();
     if (hz < 20) hz = 60;  // (unknown: the common case)
+    // (another refresh only when it holds for 60 presents: with images presented in bursts the compositor's timing read
+    // 206 - 222 Hz now and then at 240, and each reading started the levels again from the top - 4x / 2x a second)
+    static double stable_hz;
+    static int hz_odd;
+    if (!stable_hz || fabs(hz - stable_hz) < 0.03 * stable_hz) stable_hz = stable_hz ? stable_hz : hz, hz_odd = 0;
+    else if (++hz_odd >= 60) stable_hz = hz, hz_odd = 0;
+    hz = stable_hz;
     double fps = g_settings.fps > 0 ? g_settings.fps : 30;
     int cand[3], nc = 0;
     for (int m = 4; m >= 2; m--) {  // (even on the refresh first)
@@ -6784,20 +6948,32 @@ static int ip_auto_mult(uint64_t period) {
     // the GPU keeping up: by the presents' period against the game's own for this frame. Level l: candidate l / 3 at
     // the (l % 3)-th size
     static const float scales[3] = {1.0f, 0.75f, 0.5f};
-    int nl = nc * 3;
-    static int level, late, good, last_level = -1;
+    // (the optical flow: one level per candidate - its images come from the shown ones, at their size)
+    int per = g_settings.fg_method == FG_FLOW ? 1 : 3;
+    int nl = nc * per;
+    static int level, late, good, last_level = -1, key_per;
     static double wait_s = 10, last_raise_t = -100;
     static uint64_t last_t;
     static double key_hz, key_fps, key_want, grace_until;
-    if (key_hz != hz || key_fps != fps) key_hz = hz, key_fps = fps, level = 0, late = good = 0;  // (another display or rate: again)
+    if (key_hz != hz || key_fps != fps || key_per != per)  // (another display, rate or method: again)
+        key_hz = hz, key_fps = fps, key_per = per, level = 0, late = good = 0;
     uint64_t now = SDL_GetTicksNS();
     double t = now / 1e9;
     double want = (double)fps60_period_ns();
     if (want != key_want) key_want = want, grace_until = t + 3, late = good = 0;
+    // ... or images presented before their time: the window images held drawn ran out (the driver gives 8: 5 held).
+    // The optical flow draws a present's images at once, and at 4K the GPU finishes them ~16 ms after the present (the
+    // timeline's lead): at 60 fps x 4 two presents' images waited at once and went 2 - 3 to a refresh (240 Hz: 43 % of
+    // the intervals on one refresh); now it comes down to 2x as the re-rendering does
+    extern uint64_t vk_fg_forced_presents(void);
+    static uint64_t forced_seen;
+    uint64_t forced_now = vk_fg_forced_presents();
+    bool forced = forced_now != forced_seen && per == 1;  // (the optical flow's: the re-rendering as it was)
+    forced_seen = forced_now;
     if (last_t && now - last_t < 200000000ull && want > 0 && t >= grace_until) {  // (not after a pause: loading, a menu's stop)
-        if ((double)period > want * 1.08) { late++; good = 0; }
+        if ((double)period > want * 1.08 || forced) { late++; good = 0; }
         else { good++; if ((double)period < want * 1.03) late = 0; }
-        double late_s = (level + 1) % 3 ? 0.5 : 1.0;  // (a smaller size after half a second late, a lower multiplier after one)
+        double late_s = (level + 1) % per ? 0.5 : 1.0;  // (a smaller size after half a second late, a lower multiplier after one)
         if (late >= (int)(late_s * 1e9 / want) && level < nl - 1) {
             level++, late = good = 0;
             if (t - last_raise_t < 5) wait_s = fmin(wait_s * 2, 120);
@@ -6807,8 +6983,8 @@ static int ip_auto_mult(uint64_t period) {
     }
     last_t = now;
     if (level >= nl) level = nl - 1;
-    int m = cand[level / 3];
-    ip_auto_scale = scales[level % 3];
+    int m = cand[level / per];
+    ip_auto_scale = scales[level % per];
     if (level != last_level) {
         LOG("[fg] auto: %dx, in-between images at %.0f %% (display %.0f Hz%s, world %.0f fps%s; frames every %.1f ms for %.1f)\n",
             m, ip_auto_scale * 100, hz, vrr ? ", variable refresh" : "", fps, level ? ", the GPU behind: lowered" : "",
@@ -6859,6 +7035,7 @@ static bool ip_rej_log(void) {
 
 bool vk_interp_begin(TexBackend *b, TexBackend **hold, uint64_t period) {
     ip_began = false;
+    ip_flow = false;
     if (!ip_enabled()) {
         // Off (the world, a battle): what was recorded the last time it was on is stale - a menu opened later blended
         // with that old scene (a flash when the menu opened while walking)
@@ -6896,6 +7073,8 @@ bool vk_interp_begin(TexBackend *b, TexBackend **hold, uint64_t period) {
                 : cur->destroyed != g_nvn_destroyed ? "a texture destroyed" : !structural ? "format" : "a command list changed",
                 prev->valid, cur->valid, cur->nlists, prev->overflow, cur->overflow, (int)cur->destroyed, (int)g_nvn_destroyed);
     }
+    // The optical flow needs N-1's image, not its lists: only the cut check below is theirs (when they are intact)
+    bool flow_ok = flow_on() && b && b->image && b->aspect == VK_IMAGE_ASPECT_COLOR_BIT && b->samples <= 1, lists_ok = ok;
     if (ok) {
         // Per object, before the replay: the share of its changed float words that changed by a large step. Above
         // LARECOMP_INTERP_OBJ_LIMIT (0.4) the object is not blended (ip_obj_rejected); when the rejected objects hold
@@ -6951,6 +7130,15 @@ bool vk_interp_begin(TexBackend *b, TexBackend **hold, uint64_t period) {
                 (unsigned long long)big);
         if (!menu && changed && rej_changed * 10 > changed * 6) { ok = false; ip_rej[5]++; }
     }
+    if (flow_ok) {
+        // Every present keeps N's image and makes its field (the next one moves from them); without N-1's, or after a
+        // cut, N alone (k = 1: shown on the same timeline)
+        vk_end_pass();
+        ip_flow = true, ip_lo = false, ip_plan_on = false;
+        *hold = ip_keep_image(b, IP_KEEP_N, false);
+        if (!flow_prepare() || (lists_ok && !ok)) ip_k = 1;
+        return true;
+    }
     if (ok) {
         vk_end_pass();
         // (the blends decided at this present's first in-between image serve the others: ip_plan_*)
@@ -6960,6 +7148,7 @@ bool vk_interp_begin(TexBackend *b, TexBackend **hold, uint64_t period) {
         if (plan_env < 0) plan_env = getenv("LARECOMP_INTERP_PLAN") ? atoi(getenv("LARECOMP_INTERP_PLAN")) : 1, LOG("[interp-plan] mode %d\n", plan_env);
         ip_plan_on = plan_env && ip_k > 2, ip_plan_verify = plan_env == 2;
         *hold = ip_keep_image(b, IP_KEEP_N, false);
+        flow_note_n();
         // Reduced in-between images: only with frame N's full-size image to resolve them against (FSR 3.1's output, or
         // N's own image)
         ip_lo = ip_lo_factor() < 0.99f &&
@@ -6998,6 +7187,7 @@ static void ip_cam_restore(void) {
 
 // The image at t (0..1, from N-1 to N) into the game's textures (after vk_interp_begin said yes)
 void vk_interp_replay(float t) {
+    if (ip_flow) { flow.t = t; return; }  // (the optical flow: made at vk_interp_keep)
     gp_mark(vk_cmd(), "ours: replay t=%.2f", t);
     IpFrame *cur = &ipf[ipc];
     ip_t = t;

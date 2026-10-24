@@ -115,6 +115,7 @@ static void parse_line(const char *line) {
                                  !strcmp(val, "performance") ? FSR3_PERFORMANCE : !strcmp(val, "ultra") ? FSR3_ULTRA_PERFORMANCE : FSR3_QUALITY;
     else if (!strcmp(key, "frame_gen"))  // (1: an older on / off)
         g_settings.frame_gen = !strcmp(val, "auto") ? FG_AUTO : atoi(val) == 1 ? 2 : atoi(val);
+    else if (!strcmp(key, "fg_method")) g_settings.fg_method = !strcmp(val, "flow") ? FG_FLOW : FG_RERENDER;
     else if (!strcmp(key, "fg_quality")) {}  // (a setting of a test version: the in-between images are always full size)
     else if (!strcmp(key, "render_thread")) g_settings.render_thread = atoi(val) != 0;
     else if (!strcmp(key, "vertex_read")) g_settings.vertex_read = !strcmp(val, "direct") ? VREAD_DIRECT : !strcmp(val, "copy") ? VREAD_COPY : VREAD_AUTO;
@@ -165,6 +166,7 @@ void settings_apply_levels(void) {
     g_settings.upscaler_pick = UPSCALE_BILINEAR;
     g_settings.upscaler = g_settings.antialias == AA_FSR3 ? UPSCALE_FSR3 : UPSCALE_BILINEAR;
     if (g_settings.frame_gen != FG_AUTO && (g_settings.frame_gen < 2 || g_settings.frame_gen > 4)) g_settings.frame_gen = 0;
+    if (g_settings.fg_method != FG_FLOW) g_settings.fg_method = FG_RERENDER;
 }
 
 // One larecomp.ini line applied now, then the settings that follow from it (LARECOMP_SET_AT: runtime/nvn/vulkan/device.c)
@@ -220,6 +222,7 @@ void settings_save(void) {
     fprintf(f, "fsr3_preset = %s\n", presets[g_settings.fsr3_preset >= 0 && g_settings.fsr3_preset <= 4 ? g_settings.fsr3_preset : 1]);
     if (g_settings.frame_gen == FG_AUTO) fprintf(f, "frame_gen = auto\n");
     else fprintf(f, "frame_gen = %d\n", g_settings.frame_gen);
+    fprintf(f, "fg_method = %s\n", g_settings.fg_method == FG_FLOW ? "flow" : "rerender");
     fprintf(f, "mod = %s\n", g_settings.mod);
     fprintf(f, "mouse_sens = %.3f\n", g_settings.mouse_sens);
     fprintf(f, "stick_deadzone = %.2f\n", g_settings.stick_deadzone);

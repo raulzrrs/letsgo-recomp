@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+- **Optical flow: block matching ~10x cheaper** - each block's samples of frame N are read once for all the candidates
+  instead of once per candidate (the same result). Adreno 830: matching 3.66 -> 0.25 ms, refining 1.69 -> 0.14 ms a frame.
+
+- **Frame generation: a second method, optical flow** (F12 menu, advanced tab: "Frame generation method", with frame
+  generation on; `fg_method = rerender | flow` in larecomp.ini, switched live). Re-rendering (the default)
+  draws the frame again for each in-between image; the optical flow makes them from the last two frames as they are
+  shown (after FSR 3.1 / TAA / SMAA), moved toward the image's time: the renderer's motion vectors (camera and
+  objects), corrected where they miss what the image does - moving shadows on still ground, particles, water,
+  reflections - by block matching on the image (only where it clearly fits better, and only among blocks of the same
+  surface: the ground's vectors had torn grass into the characters' clothes); what was covered in N-1 (its depth)
+  taken from N alone, what was uncovered since from N-1 along the background's motion; the interface frame N's own.
+  At 4K (FSR 3.1 native, SSAO, GI high) an in-between image costs 1.16 ms of GPU against 3.90 (720p: 0.23 against
+  1.29), with no CPU replay of the frame: at 240 Hz, 30 fps x 4, 90 % of the intervals on time at 4K (re-rendering 39 %),
+  96.5 % at 720p (76 %). The walk in the grass: flicker as re-rendering's (0.76 / 0.93 % of the blocks at 2x / 3x
+  against 0.83 / 0.93), detail within 1.3 % of the real frames, 91 % of the moving blocks halfway (the same). Its
+  limits: thin halos where a moving thing uncovers the background (the cap's outline, between the legs), a smear at the
+  edge coming into view, and shadows that move a little softer. Frame generation "Auto" with it comes down a multiplier
+  when the window images held for later run out (the driver gives 8): at 4K and 60 fps, 4x went 2 - 3 images to a
+  refresh, 2x is on time 92 % of the intervals. Research: `LARECOMP_FLOW_MATCH`, `_RADIUS`, `_OCCLUSION`, `_SHARP`,
+  `_DEBUG` (docs/DEPURACAO.md).
+- **Frame generation "Auto" keeps its level when the display's refresh reads wrong for a moment** (the compositor's
+  timing read 206 - 222 Hz at 240 now and then with images presented in bursts): another refresh only after it holds
+  for 60 presents; each reading had started the levels again from 4x.
+
 ## 0.6.0 (2026-10-22)
 
 Iván Serrano's ([@Vancete](https://github.com/Vancete), PRs #17 and #19): the in-house frame generation, SSAO Ultra,
