@@ -22,7 +22,7 @@ extern "C" {
 
 #define RT_BUNDLE_ID "com.peiikai.lasrecomp"  // (data folder on macOS / Linux: kept)
 #define RT_APP_NAME "Let's Go Recomp"         // window title, messages, the launcher
-#define RT_APP_VERSION "0.7.5"                // the release (Makefile `dist` names the zip after it)
+#define RT_APP_VERSION "0.7.6"                // the release (Makefile `dist` names the zip after it)
 
 void rt_paths_init(void);         // first thing in main(), after plat_init
 const char *rt_data_root(void);   // absolute

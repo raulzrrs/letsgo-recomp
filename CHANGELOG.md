@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.6 (2026-10-25)
+
+- **Fix: losing a wild battle left the player where they were, with the party fainted** (and the next battle ended at
+  once). It now blacks out as the game does after any lost battle: the last Pokémon Center, or home, the party healed.
+
 ## 0.7.5 (2026-10-25)
 
 - **Fix: at 60 fps, the wild battle that comes back after a ball breaks ran as a menu** - at 60 with in-between
