@@ -396,8 +396,45 @@ static int fade_log_hook(Cpu *c, uint64_t addr) {
     return 0;
 }
 
+// A battle of ours lost (the party fainted): the game's own static battles leave that to their script, which calls the
+// native CallBattleLose_ (f_700017e880: the process manager and allocator from the globals at 0x70015fad08 / ab8, then
+// f_700017f280 makes the "out of usable Pokémon" process - the black-out screen, then the last Pokémon Center or
+// home, the party healed). Ours start from a touch in the world, with no script: the player came back where they were
+// with the party fainted, and the next battle ended at once. On the world's next update it is called here.
+#define BATTLE_LOSE_FN 0x700017f280ull
+#define G_PROC_MANAGER 0x70015fad08ull
+#define G_PROC_ALLOC 0x70015faab8ull
+static bool g_lost;
+static void battle_lost(Cpu *c) {
+    uint64_t save[32], lr = c->x[30], sp = c->sp, out[2] = {0, 0};
+    memcpy(save, c->x, sizeof save);
+    c->x[0] = R64(R64(R64(G_PROC_MANAGER, 0), 0), 0x68);  // (pointers to the globals: [[[G]] + 0x68])
+    c->x[1] = R64(R64(R64(G_PROC_ALLOC, 0), 0), 0x68);
+    c->x[8] = (uint64_t)(uintptr_t)out;
+    if (!c->x[0] || !c->x[1]) {
+        LOG("[wild] f%llu the battle was lost, but no process manager: the black-out not shown\n", (unsigned long long)renderer_game_frame());
+        memcpy(c->x, save, sizeof save);
+        c->x[30] = lr, c->sp = sp;
+        return;
+    }
+    LOG("[wild] f%llu the battle was lost: the black-out (manager %llx)\n", (unsigned long long)renderer_game_frame(), (unsigned long long)c->x[0]);
+    rt_call_original(c, BATTLE_LOSE_FN);
+    if (out[0]) {  // (its handle let go, as the native does)
+        uint64_t o = out[0] + 0x48;
+        c->x[0] = o;
+        rt_call_original(c, R64(R64(o, 0), 0x18));
+    }
+    memcpy(c->x, save, sizeof save);
+    c->x[30] = lr, c->sp = sp;
+}
+
 static int field_hook(Cpu *c, uint64_t addr) {
     (void)addr;
+    if (g_lost && !g_active) {
+        g_lost = false;
+        g_fadein_done = true;  // (the black-out screen does its own)
+        battle_lost(c);
+    }
     if (g_catch.rebattle && !g_active && g_end_frame && (long)renderer_game_frame() >= g_end_frame + 2) {
         uint64_t save[32], lr = c->x[30], sp = c->sp;
         memcpy(save, c->x, sizeof save);
@@ -718,6 +755,10 @@ static int battle_event_hook(Cpu *c, uint64_t addr) {
                 LOG("[wild] f%llu catch: the wild Pokémon fainted, no capture\n", (unsigned long long)renderer_game_frame());
             } else if (res == 1)
                 g_catch.catching = true;
+            else if (res == 0) {
+                g_lost = true;
+                LOG("[wild] f%llu the party fainted: the battle is lost\n", (unsigned long long)renderer_game_frame());
+            }
         }
     }
     if (g_state_log) {
@@ -1085,6 +1126,8 @@ static int setup_hook(Cpu *c, uint64_t addr) {
     static int hp = -2;
     if (hp == -2) hp = getenv("LARECOMP_WILDBATTLE_HP") ? atoi(getenv("LARECOMP_WILDBATTLE_HP")) : -1;
     if (g_active && hp > 0 && id >= 6 && !g_catch.rebattle) R16(b, 0x7e) = (uint16_t)(hp < R16(b, 0x7c) ? hp : R16(b, 0x7c));
+    // (test runs: LARECOMP_WILDBATTLE_LOSE=1 starts the player's first Pokémon with 1 HP and the others fainted - a loss)
+    if (g_active && id < 6 && getenv("LARECOMP_WILDBATTLE_LOSE")) R16(b, 0x7e) = id == 0 ? 1 : 0;
     if (g_hp_log)
         LOG("[wild] f%llu battle Pokémon %llx set up: species %u HP %u/%u, id %u\n", (unsigned long long)renderer_game_frame(),
             (unsigned long long)b, R16(b, 0x78), R16(b, 0x7e), R16(b, 0x7c), id);

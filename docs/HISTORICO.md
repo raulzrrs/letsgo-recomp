@@ -791,3 +791,20 @@ Pedido: capturar a qualquer momento da batalha, mais fácil com o selvagem fraco
   Testado a 60 fps com bolas estourando: cada volta passa a `battle / capture: 30 fps` dois ou três quadros depois de
   começar. O limite da abertura escondida subiu de 900 para 1500 quadros (uma volta a 60 fps chegou a 860 e foi
   mostrada antes do menu).
+
+## Batalhas selvagens: perder não levava ao Centro Pokémon (25/10/2026)
+- **Origem.** A atualização 1.1 do mod "Wild Battles" do GameBanana (Rico-Santos, patch IPS para o 1.0.2) corrige
+  "perder uma batalha selvagem não leva ao Centro Pokémon nem para casa: o jogo segue com o time desmaiado". Testamos o
+  nosso: o mesmo bug.
+- **Teste.** `LARECOMP_WILDBATTLE_LOSE=1` (opção nova: o primeiro Pokémon do jogador com 1 HP, os outros desmaiados).
+  Depois das falas 63 / 66 da batalha, o evento termina com resultado 0 (estados 5, 6, 7, 8, 12) e o jogador volta ao
+  mesmo mato; na batalha seguinte o Eevee continua com 0 HP.
+- **Causa.** Nas batalhas estáticas do jogo quem trata a derrota é o script do evento, que chama o nativo
+  `CallBattleLose_` (`f_700017e880`, na tabela de nativos {nome, função}: relocação `0x153a750`). A nossa batalha nasce
+  de um toque no mundo, sem script. (O mod faz outra coisa: na função `f_700031a0d8` do pós-batalha, que classifica o
+  encontro pela espécie - `f_7000724950` é "a espécie": 144/145/146/150 → 2, 100/101/111/143 → 1, as outras → 0 -,
+  troca o padrão de 0 para 1; aqui essa função nem roda na derrota.)
+- **Correção.** Resultado 0 numa batalha nossa: na próxima atualização do mundo, o que o nativo faz -
+  `f_700017f280(gerenciador, alocador)` com os globais `[[[0x70015fad08]]+0x68]` / `[[[0x70015faab8]]+0x68]`, e o
+  handle solto -, sem o fade-in manual. Testado: "You hurried home with your tired Pokémon...", a casa, a mãe cura o
+  time. Pikachu: `17f280` → `17f250`.
