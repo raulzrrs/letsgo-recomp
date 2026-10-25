@@ -37,7 +37,7 @@ bool setup_needs_build(void);
 const char *game_name(const char *exefs);
 // The build of that exefs/main: one with address tables (runtime/fnhook.c, tools/patches.py) - the 60 fps and wild
 // battles options and the generator's patches - or GAME_BUILD_OTHER (an update, say: those stay off).
-enum { GAME_BUILD_OTHER, GAME_BUILD_EEVEE_100, GAME_BUILD_PIKACHU_100 };
+enum { GAME_BUILD_OTHER, GAME_BUILD_EEVEE_100, GAME_BUILD_PIKACHU_100, GAME_BUILD_EEVEE_102 };
 int game_build(const char *exefs);
 // Its version ("1.0.0", "1.0.2"...: the builds known by their build id; "1.0.0" otherwise), told to the game (am).
 const char *game_version(const char *exefs);

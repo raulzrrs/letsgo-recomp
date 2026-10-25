@@ -520,9 +520,9 @@ void ui_page_graphics(float x, bool known) {
         ImGui::BeginDisabled(!known);
         if (ui_combo("##fps", &f, fr, 3)) g_settings.fps = f == 2 ? 120 : f == 1 ? 60 : 30;
         ImGui::EndDisabled();
-        ui_tip(!known ? UI_T("Only with version 1.0.0 (the base game) of Eevee or Pikachu for now.",
-                             "Por enquanto só na versão 1.0.0 (o jogo base) do Eevee ou do Pikachu.",
-                             "Пока только с версией 1.0.0 (базовая игра) Eevee или Pikachu.")
+        ui_tip(!known ? UI_T("Only with Eevee 1.0.0 or 1.0.2, or Pikachu 1.0.0, for now.",
+                             "Por enquanto só no Eevee 1.0.0 ou 1.0.2, ou no Pikachu 1.0.0.",
+                             "Пока только с Eevee 1.0.0 или 1.0.2 либо Pikachu 1.0.0.")
                       : UI_T("The world at 60 or 120 fps; menus, the Pokédex, battles and captures stay at 30.",
                              "Mundo a 60 ou 120 fps; menus, Pokédex, batalhas e capturas continuam a 30.",
                              "Мир на 60 или 120 к/с; меню, Покедекс, бои и поимки остаются на 30."));

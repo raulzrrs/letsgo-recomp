@@ -60,8 +60,8 @@ In the game, **F12** opens the same settings, applied at once:
 ## Supported games
 
 - *Let's Go, Eevee!* and *Let's Go, Pikachu!*, any region, from your own dump (cartridge or eShop)
-- **1.0.0** (the base game) for every option; the 1.0.1 / 1.0.2 updates are accepted, less tested, without the frame
-  rate, wild battles and controller options
+- **1.0.0** (the base game) of either, and *Eevee* **1.0.2** (the update), for every option; the other updates are
+  accepted, less tested, without the frame rate, wild battles and controller options
 - `.xci` / `.nsp` files must be extracted first
 
 Most tested with *Eevee* 1.0.0; *Pikachu* 1.0.0 less.

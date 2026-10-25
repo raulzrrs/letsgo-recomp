@@ -550,8 +550,8 @@ extern "C" void launcher_lg_run(const char *root) {
         ImGui::NewFrame();
         float s = g_scale;
         bool known = !setup_ready() || game_build("extracted/exefs") != GAME_BUILD_OTHER;
-        const char *only = T("Only with version 1.0.0 (the base game) of Eevee or Pikachu for now.",
-                             "Por enquanto só na versão 1.0.0 (o jogo base) do Eevee ou do Pikachu.");
+        const char *only = T("Only with Eevee 1.0.0 or 1.0.2, or Pikachu 1.0.0, for now.",
+                             "Por enquanto só no Eevee 1.0.0 ou 1.0.2, ou no Pikachu 1.0.0.");
         const char *names[NTABS] = {T("Game", "Jogo"), T("Graphics", "Gráficos"), T("Image and sound", "Imagem e som"),
                                     T("Controls", "Controles"), "Mods"};
         ui_tabs_begin(&tab, NTABS);  // (L1 / R1 on a controller: the page before / after)

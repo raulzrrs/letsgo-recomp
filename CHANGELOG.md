@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Eevee 1.0.2 (the update) gets every option**: 60 / 120 fps, wild battles and skipping the controller screen were
+  only for 1.0.0; the runtime's hooks and the generator's patches now have the 1.0.2 addresses too. Pikachu 1.0.2
+  isn't covered yet. The game code is rebuilt once on the first start after updating.
+
 ## 0.7.6 (2026-10-25)
 
 - **Fix: losing a wild battle left the player where they were, with the party fainted** (and the next battle ended at

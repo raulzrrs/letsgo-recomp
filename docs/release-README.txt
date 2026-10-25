@@ -8,7 +8,7 @@ NO GAME FILES ARE INCLUDED. You need your own legally obtained copy of Pokemon: 
 extracted (the exefs and romfs folders).
 
 Supported: Pokemon: Let's Go, Eevee! (title id 0100187003A36000) and Pikachu! (010003F003A34000), any version.
-The experimental options below need version 1.0.0 (the base game) of either; Pikachu 1.0.0
+The experimental options below need version 1.0.0 (the base game) of either, or Eevee 1.0.2; Pikachu 1.0.0
 was tested up to the name screen of a new game. Cartridge or eShop, any region.
 Packed files (.xci, .nsp, .nsz, .nca) must be extracted first.
 
@@ -33,7 +33,7 @@ How to play
    takes a while (22 minutes measured on a 20-thread CPU, longer with fewer threads).
 5. Click Play.
 
-Experimental options (start screen; version 1.0.0 of either game: greyed out for updated games)
+Experimental options (start screen; 1.0.0 of either game or Eevee 1.0.2: greyed out for other versions)
 - Frame rate limit (Graphics page, also in the F12 menu): 30 (the game's), 60 or 120 fps - the overworld at that rate
   without speed-ups; menus, the Pokedex, battles and captures stay at 30, as on the console.
 - Wild battles (Game page, off by default): touching a wild Pokemon starts a classic battle against it, then the capture.

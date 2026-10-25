@@ -821,3 +821,31 @@ Pedido: capturar a qualquer momento da batalha, mais fácil com o selvagem fraco
   mundo a 60. Com a geração de quadros ligada os menus continuam interpolados (é o que ela pede).
   `LARECOMP_FPS60_MENU_INTERP=1` traz a imagem intermediária dos menus de volta, para comparar. O orçamento da
   resolução dinâmica nos menus voltou a 33 ms (16,7 só com a geração de quadros).
+
+## Atualização 1.0.2 do Eevee com todas as opções (25/10/2026)
+- **Pedido.** Suportar a atualização v1.0.2 (v131072): até aqui ela rodava, mas como build desconhecido
+  (`GAME_BUILD_OTHER`), sem 60 fps, batalhas selvagens e pular a tela do controle.
+- **Arquivos.** Do NSP de atualização do Eevee do usuário, com o `prod.keys` do console dele (o mesmo da extração
+  original: tem `device_key_4x` e `sd_seed`). O `hactool` 1.4.0 recusa esse `prod.keys` inteiro (uma chave com 17 bytes):
+  usamos uma cópia só com as chaves de NCA. ExeFS: o NCA de programa da atualização sozinho. RomFS: é um patch (BKTR)
+  sobre a do jogo base, então `--basenca` com o NCA de programa do XCI; `--romfs=arquivo` não grava nada nesse caso e
+  `--romfsdir` precisa da pasta-mãe criada antes. O setup monta a `romfs.bin` da pasta (27.818 arquivos, como a base).
+- **O que mudou no `main`.** Build id `5831ec64d6b696fd`. O código andou de 0 a -0x130 conforme o trecho; dados,
+  globais e GOT ficaram nos mesmos endereços (`.data` do mesmo tamanho; a tabela G em `0x7000f7eeb8` e os slots usados
+  pelas batalhas conferidos byte a byte).
+- **Mapa.** `tools/addrmap.py` achou 65 dos 69 endereços do runtime; os outros 4 (os dois destrutores do processo
+  classe A, a fábrica `17f0a0` e o construtor do quadro do botão `aaac10`) não são únicos pela janela mascarada: pelo
+  deslocamento dos vizinhos, conferido instrução por instrução. Como o `addrmap` mascara os imediatos de `ldr/str/add`,
+  comparamos também as instruções cruas das 69 funções: nenhum offset de struct mudou. Os 3 remendos do gerador
+  (`tools/patches.py`) caem em instruções idênticas.
+- **Código.** `runtime/fnhook.c`: uma tabela por build (`build_table`), `k_eevee_102`; `GAME_BUILD_EEVEE_102` em
+  `runtime/gamesetup.c`; `BUILD_ADDRS` do 1.0.2 em `tools/patches.py` (o gerador loga "3 instruction patches moved").
+  `tools/capture_loop.py` ganhou `DATA=<pasta>` para rodar outra instalação.
+- **Teste** (release em `D:\teste-1.0.2\Eevee`, setup pela pasta, 60 fps): mundo a 60 com a correção da caminhada nos
+  endereços novos; batalha selvagem com o CATCH nativo, nocaute ("fainted, no capture"), pedido de captura com a taxa,
+  a volta à batalha depois da cena de captura (igual ao 1.0.0 com o mesmo roteiro), derrota levando para casa, pular a
+  tela do controle. Nenhum "no such function in this build" nos logs. As cutscenes (`EvCameraStart/End`) estão
+  mapeadas, mas nenhuma rodou nos testes.
+- **Consequência.** O `GAMELIB_ID` inclui o gerador (`tools/patches.py`): a release com isso recompila o código do jogo
+  de todo mundo na primeira abertura, inclusive no 1.0.0.
+- **Falta.** Pikachu 1.0.2 (build `c208db6a4ef4361f`, do log da issue #1): precisa do `main` dele para mapear.

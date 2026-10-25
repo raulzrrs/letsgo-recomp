@@ -50,13 +50,47 @@ static const uint64_t k_pikachu_100[][2] = {
     {0x70007de080, 0x70007de0b0}, {0x7000a5c350, 0x7000a5c360}, {0x7000aaf230, 0x7000aaf240}, {0x7000319bc0, 0x7000319b90}, {0x70007de440, 0x70007de470}, {0x70009f7300, 0x70009f7310},
     {0x7000a7e090, 0x7000a7e0a0}, {0x7000a99b40, 0x7000a99b50}, {0x7000a9c700, 0x7000a9c710}, {0x700016d060, 0x700016d030}, {0x700017f280, 0x700017f250},
 };
+// Let's Go Eevee 1.0.2 (the update: the code moved by up to -0x130; the data, globals and GOT slots are where they
+// were). The four not unique by addrmap (two destructors, the factory, the frame constructor) by their neighbours' offset,
+// checked instruction by instruction.
+static const uint64_t k_eevee_102[][2] = {
+    {0x70000395f0, 0x70000395f0}, {0x7000039600, 0x7000039600}, {0x700004eb50, 0x700004eb50}, {0x700011ece0, 0x700011ece0},
+    {0x700011ee50, 0x700011ee50}, {0x700016d060, 0x700016cff0}, {0x700017f0a0, 0x700017f030}, {0x700017f280, 0x700017f210},
+    {0x70001809f0, 0x7000180980}, {0x7000180a20, 0x70001809b0}, {0x7000180a40, 0x70001809d0}, {0x7000180a70, 0x7000180a00},
+    {0x7000197e90, 0x7000197e20}, {0x7000198b20, 0x7000198ab0}, {0x70001afc00, 0x70001afb90}, {0x700020b810, 0x700020b6e0},
+    {0x70002185d0, 0x70002184a0}, {0x70002186a0, 0x7000218570}, {0x700021b720, 0x700021b5f0}, {0x70002462e0, 0x70002461b0},
+    {0x7000289ac0, 0x7000289990}, {0x7000289b40, 0x7000289a10}, {0x7000289f60, 0x7000289e30}, {0x7000289fd0, 0x7000289ea0},
+    {0x700028bb60, 0x700028ba30}, {0x700028be80, 0x700028bd50}, {0x700028c770, 0x700028c640}, {0x700028ef70, 0x700028ee40},
+    {0x70002bad00, 0x70002babd0}, {0x70002f60c0, 0x70002f5f90}, {0x70002f65d0, 0x70002f64a0}, {0x70002f78d0, 0x70002f77a0},
+    {0x70002f8bb0, 0x70002f8a80}, {0x70003058f0, 0x70003057c0}, {0x7000305a98, 0x7000305968}, {0x7000305ad0, 0x70003059a0},
+    {0x7000319bc0, 0x7000319a90}, {0x700031a0e0, 0x7000319fb0}, {0x7000368330, 0x7000368200}, {0x70006237b0, 0x7000623680},
+    {0x7000641190, 0x7000641060}, {0x7000663660, 0x7000663530}, {0x7000664cd0, 0x7000664ba0}, {0x70006786b0, 0x7000678580},
+    {0x700071dfd0, 0x700071dea0}, {0x70007dcb00, 0x70007dc9d0}, {0x70007de080, 0x70007ddf50}, {0x70007de440, 0x70007de310},
+    {0x70009114b0, 0x7000911380}, {0x7000912640, 0x7000912510}, {0x7000919970, 0x7000919840}, {0x70009d8ae0, 0x70009d8a20},
+    {0x70009e2490, 0x70009e23d0}, {0x70009e4280, 0x70009e41c0}, {0x70009f7300, 0x70009f7240}, {0x7000a5c350, 0x7000a5c290},
+    {0x7000a7e090, 0x7000a7dfd0}, {0x7000a99b40, 0x7000a99a80}, {0x7000a9c700, 0x7000a9c640}, {0x7000aaac10, 0x7000aaab50},
+    {0x7000aaf230, 0x7000aaf170}, {0x7000ab1670, 0x7000ab15b0}, {0x7000ab1af0, 0x7000ab1a30}, {0x7000ab1e80, 0x7000ab1dc0},
+    {0x7000ab2730, 0x7000ab2670}, {0x7000ab49f0, 0x7000ab4930}, {0x7000ab4a20, 0x7000ab4960}, {0x7000ab4a30, 0x7000ab4970},
+    {0x7000ab4a50, 0x7000ab4990},
+};
 static int g_build = -1;  // GAME_BUILD_* (runtime/gamesetup.h); -1 before the first boot
+
+// The running build's table (NULL: Eevee 1.0.0 itself, or a build without one)
+static const uint64_t (*build_table(size_t *n))[2] {
+#define TABLE(t) (*n = sizeof t / sizeof *t, t)
+    if (g_build == GAME_BUILD_PIKACHU_100) return TABLE(k_pikachu_100);
+    if (g_build == GAME_BUILD_EEVEE_102) return TABLE(k_eevee_102);
+#undef TABLE
+    *n = 0;
+    return NULL;
+}
 
 uint64_t rt_addr(uint64_t eevee) {
     if (g_build == GAME_BUILD_EEVEE_100 || g_build < 0) return eevee;
-    if (g_build == GAME_BUILD_PIKACHU_100)
-        for (size_t i = 0; i < sizeof k_pikachu_100 / sizeof *k_pikachu_100; i++)
-            if (k_pikachu_100[i][0] == eevee) return k_pikachu_100[i][1];
+    size_t n;
+    const uint64_t (*t)[2] = build_table(&n);
+    for (size_t i = 0; i < n; i++)
+        if (t[i][0] == eevee) return t[i][1];
     return 0;
 }
 
@@ -121,9 +155,10 @@ int rt_fnhook(Cpu *c, uint64_t addr) {
 // The game's function at addr (gamelib tables), run as if called: x0.. as set by the caller of the hook.
 // addr: the hooked function (as the hook received it) or an Eevee 1.0.0 address from the runtime's code (translated).
 void rt_call_original(Cpu *c, uint64_t addr) {
-    if (g_build == GAME_BUILD_PIKACHU_100)
-        for (size_t i = 0; i < sizeof k_pikachu_100 / sizeof *k_pikachu_100; i++)
-            if (k_pikachu_100[i][0] == addr) { addr = k_pikachu_100[i][1]; break; }
+    size_t n;
+    const uint64_t (*bt)[2] = build_table(&n);
+    for (size_t i = 0; i < n; i++)
+        if (bt[i][0] == addr) { addr = bt[i][1]; break; }
     const GameLibTables *t = gamelib_tables();
     for (uint32_t m = 0; t && m < t->nmods; m++) {
         const GameLibModule *md = &t->mods[m];

@@ -15,7 +15,7 @@ Leva por volta de meia hora, quase toda esperando downloads e a compilação.
 - Uns 10 GB livres (arquivos do jogo, código gerado e build)
 - [Git for Windows](https://git-scm.com/download/win) (traz o Git Bash)
 - **Os seus próprios arquivos do jogo**: *Pokémon: Let's Go, Eevee!* ou *Pikachu!*, extraídos da sua cópia (o Eevee
-  **v1.0.0** é o mais testado; as opções experimentais pedem a 1.0.0 de um dos dois). Este
+  **v1.0.0** é o mais testado; as opções experimentais pedem a 1.0.0 de um dos dois ou o Eevee 1.0.2). Este
   projeto não fornece nem ensina a obter esses arquivos ou as chaves.
 
 ## 1. Baixar o projeto
@@ -71,7 +71,7 @@ extracted/
 ```
 
 O código gerado depende do executável exato: os remendos do gerador (`tools/patches.py`) e os ganchos do runtime só
-são endereços do `main` 1.0.0 (tabela por build: Eevee e Pikachu, `tools/addrmap.py`) e ficam desligados
+são endereços do `main` (tabela por build: Eevee 1.0.0 e 1.0.2, Pikachu 1.0.0, `tools/addrmap.py`) e ficam desligados
 para qualquer outro. `extracted/` está
 no `.gitignore` e nunca deve ir para o git.
 

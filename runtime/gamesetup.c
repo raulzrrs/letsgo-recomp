@@ -28,6 +28,7 @@
 #define TITLE_PIKACHU 0x010003F003A34000ull
 static const uint8_t EEVEE_100[8] = {0x0a, 0x3f, 0x0d, 0x21, 0xe6, 0x7d, 0xad, 0x80};    // Let's Go, Eevee! v1.0.0 main
 static const uint8_t PIKACHU_100[8] = {0x1c, 0x37, 0x56, 0x92, 0xde, 0x4f, 0x4b, 0x87};  // Let's Go, Pikachu! v1.0.0
+static const uint8_t EEVEE_102[8] = {0x58, 0x31, 0xec, 0x64, 0xd6, 0xb6, 0x96, 0xfd};    // Let's Go, Eevee! v1.0.2 main
 
 static _Atomic int g_state;
 static _Atomic float g_progress;
@@ -84,6 +85,7 @@ int game_build(const char *exefs) {
     uint64_t pid = program_id(exefs);
     if (n == 8 && !memcmp(id, EEVEE_100, 8) && pid == TITLE_EEVEE) return GAME_BUILD_EEVEE_100;
     if (n == 8 && !memcmp(id, PIKACHU_100, 8) && pid == TITLE_PIKACHU) return GAME_BUILD_PIKACHU_100;
+    if (n == 8 && !memcmp(id, EEVEE_102, 8) && pid == TITLE_EEVEE) return GAME_BUILD_EEVEE_102;
     return GAME_BUILD_OTHER;
 }
 
@@ -91,6 +93,7 @@ const char *game_version(const char *exefs) {
     static const struct { uint8_t id[8]; const char *v; } k[] = {
         {{0x0a, 0x3f, 0x0d, 0x21, 0xe6, 0x7d, 0xad, 0x80}, "1.0.0"},  // Eevee
         {{0x1c, 0x37, 0x56, 0x92, 0xde, 0x4f, 0x4b, 0x87}, "1.0.0"},  // Pikachu
+        {{0x58, 0x31, 0xec, 0x64, 0xd6, 0xb6, 0x96, 0xfd}, "1.0.2"},  // Eevee
         {{0xc2, 0x08, 0xdb, 0x6a, 0x4e, 0xf4, 0x36, 0x1f}, "1.0.2"},  // Pikachu (issue #1's log)
     };
     char p[1100];
