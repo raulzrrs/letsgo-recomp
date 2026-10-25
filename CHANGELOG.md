@@ -4,6 +4,10 @@
 
 - **Fix: losing a wild battle left the player where they were, with the party fainted** (and the next battle ended at
   once). It now blacks out as the game does after any lost battle: the last Pokémon Center, or home, the party healed.
+- **Fix: at 60 fps, ghosts in menus and maps** (the towns' icons on the Pokédex's habitat map, the save screen's
+  badges drawn twice or in the wrong place): menus no longer get the in-between image. Menus, the Pokédex, battles and
+  captures run at 30 as on the console; the world stays at 60. (With frame generation on, menus are still
+  interpolated.)
 
 ## 0.7.5 (2026-10-25)
 
