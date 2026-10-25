@@ -990,12 +990,15 @@ static uint64_t fx_frame(void) { return renderer_present_count() + ip_replays + 
 bool vk_interp_enabled(void) { return ip_enabled(); }  // (cmdbuf.c: hooks the game's object draw functions)
 static bool ip_enabled(void) {
     // Frame generation (F12 menu, frame_gen = 2 / 3 / 4): everywhere, k images per frame (ip_images). Without it, the
-    // 60 fps mode (runtime/hle/fps60.c): the world at 60 natively; menus and the Pokédex at the game's 30 with the
-    // in-between image; battles and captures at 30 without it (tried, left out: docs/HISTORICO.md 46).
-    // LARECOMP_INTERP=1 (research): always on.
+    // 60 fps mode (runtime/hle/fps60.c): the world at 60 natively; menus, the Pokédex, battles and captures at the game's
+    // 30, as on the console. (Menus had the in-between image until 0.7.6: identical icons - the towns on the Pokédex's
+    // habitat map, the save screen's badges - were paired across frames with the wrong copy and drawn halfway between
+    // the two. LARECOMP_FPS60_MENU_INTERP=1 brings it back, to compare.) LARECOMP_INTERP=1 (research): always on.
     if (ip_on == -1) ip_on = getenv("LARECOMP_INTERP") ? atoi(getenv("LARECOMP_INTERP")) : 0;
+    static int menu_interp = -1;
+    if (menu_interp < 0) menu_interp = getenv("LARECOMP_FPS60_MENU_INTERP") != NULL;
     extern bool fps60_menu(void);
-    return g_settings.frame_gen >= FG_AUTO || ip_on > 0 || fps60_menu();
+    return g_settings.frame_gen >= FG_AUTO || ip_on > 0 || (menu_interp && fps60_menu());
 }
 static const void *ip_cbuf(int stage, int k, uint64_t addr, uint32_t size);
 static void ip_note_list(uint64_t handle);

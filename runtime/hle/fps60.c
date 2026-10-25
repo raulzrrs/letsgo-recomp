@@ -259,7 +259,7 @@ void fps60_present(void) {
     g_world = w;
     static int last = -1;  // 0 world, 1 menu (in-between images), 2 battle / capture
     int state = w ? 0 : fps60_menu() ? 1 : 2;
-    static const char *const name[] = {"world: %d fps", "menu: 30 fps with in-between images", "battle / capture: 30 fps"};
+    static const char *const name[] = {"world: %d fps", "menu: 30 fps", "battle / capture: 30 fps"};
     if (state != last) {
         char what[64];
         snprintf(what, sizeof what, name[state], g_rate);
@@ -281,7 +281,7 @@ void fps60_configure(void) {
     // the world's update always: g_played tells the title screen (game_title) whatever the frame rate
     else if (rt_addr(FIELD_UPDATE)) rt_register_fnhook(FIELD_UPDATE, field_hook);
     g_world = true, g_special = g_scene = g_played = false;
-    if (g_on) LOG("[fps60] on: the world at %d, menus at 30 with in-between images, battles and captures at 30\n", g_rate);
+    if (g_on) LOG("[fps60] on: the world at %d, menus, battles and captures at 30\n", g_rate);
 }
 
 __attribute__((constructor)) static void fps60_init(void) {

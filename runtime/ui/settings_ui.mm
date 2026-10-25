@@ -511,7 +511,7 @@ void ui_page_graphics(float x, bool known) {
     int n;
     const char *const *l = graphics_labels(&n);
     // the world's frame rate (runtime/hle/fps60.c, switched at the next present): the game's 30, 60, or 120 (more
-    // experimental); menus stay at 30 with an in-between image (60), battles and captures at 30
+    // experimental); menus, battles and captures stay at 30
     {
         const char *fr[] = {UI_T("30 fps (original)", "30 fps (original)", "30 fps (оригинал)"), "60 fps",
                             UI_T("120 fps (experimental)", "120 fps (experimental)", "120 fps (экспериментально)")};
@@ -523,9 +523,9 @@ void ui_page_graphics(float x, bool known) {
         ui_tip(!known ? UI_T("Only with version 1.0.0 (the base game) of Eevee or Pikachu for now.",
                              "Por enquanto só na versão 1.0.0 (o jogo base) do Eevee ou do Pikachu.",
                              "Пока только с версией 1.0.0 (базовая игра) Eevee или Pikachu.")
-                      : UI_T("The world at 60 or 120 fps; menus and the Pokédex smoothed; battles and captures stay at 30.",
-                             "Mundo a 60 ou 120 fps; menus e Pokédex suavizados; batalhas e capturas continuam a 30.",
-                             "Мир на 60 или 120 к/с; меню и Покедекс сглажены; бои и поимки остаются на 30."));
+                      : UI_T("The world at 60 or 120 fps; menus, the Pokédex, battles and captures stay at 30.",
+                             "Mundo a 60 ou 120 fps; menus, Pokédex, batalhas e capturas continuam a 30.",
+                             "Мир на 60 или 120 к/с; меню, Покедекс, бои и поимки остаются на 30."));
     }
     ui_group_gap();
     // SSAO and GI by quality level (their parameters: settings_apply_levels; high = what they had before the levels)

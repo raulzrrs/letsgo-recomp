@@ -808,3 +808,16 @@ Pedido: capturar a qualquer momento da batalha, mais fácil com o selvagem fraco
   `f_700017f280(gerenciador, alocador)` com os globais `[[[0x70015fad08]]+0x68]` / `[[[0x70015faab8]]+0x68]`, e o
   handle solto -, sem o fade-in manual. Testado: "You hurried home with your tired Pokémon...", a casa, a mãe cura o
   time. Pikachu: `17f280` → `17f250`.
+
+## 60 fps: fantasmas nos menus e mapas - menus sem imagem intermediária (25/10/2026)
+- **Relato (usuário, prints).** No modo 60 fps, ícones do mapa e as fichas da tela de salvar aparecem duplicados e fora
+  do lugar.
+- **Reproduzido.** Pokédex → "Check habitat", tela parada, 100 imagens intermediárias: os ícones das cidades em lugares
+  errados em relação ao quadro real (~2.300–2.800 pixels diferentes em todas). Ícones iguais, desenhados com teste de
+  profundidade, entram no casamento dos desenhos 3D, que os troca de cidade; a regra de salto (metade dos dois valores
+  + 100) é frouxa para coordenadas de tela. Uma correção na escolha do par (repetir a escolha quando o primeiro cbuf
+  tem várias cópias exatas) não mudou nada e foi desfeita.
+- **Decisão (usuário).** Menus sem imagem intermediária: menus, Pokédex, batalhas e capturas a 30, como no console; o
+  mundo a 60. Com a geração de quadros ligada os menus continuam interpolados (é o que ela pede).
+  `LARECOMP_FPS60_MENU_INTERP=1` traz a imagem intermediária dos menus de volta, para comparar. O orçamento da
+  resolução dinâmica nos menus voltou a 33 ms (16,7 só com a geração de quadros).

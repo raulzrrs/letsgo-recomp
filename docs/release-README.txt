@@ -35,7 +35,7 @@ How to play
 
 Experimental options (start screen; version 1.0.0 of either game: greyed out for updated games)
 - Frame rate limit (Graphics page, also in the F12 menu): 30 (the game's), 60 or 120 fps - the overworld at that rate
-  without speed-ups; menus and the Pokedex smoothed; battles and captures stay at 30.
+  without speed-ups; menus, the Pokedex, battles and captures stay at 30, as on the console.
 - Wild battles (Game page, off by default): touching a wild Pokemon starts a classic battle against it, then the capture.
 The controller stick dead zone is on the Controls page.
 
