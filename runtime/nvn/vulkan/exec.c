@@ -1895,8 +1895,49 @@ static void translate_program(void *arg) {
     compile_program(p);  // (this worker: queued again it would wait behind the other translations)
 }
 
-#define PROG_TAB 4096
-static struct { uint64_t key; Prog *prog; } prog_tab[PROG_TAB];
+// Programs and pipelines by key hash, for the whole session: tables that double at half full. (They were fixed: 4096
+// programs that replaced an entry after 64 full slots - two programs then built each other again on every frame,
+// each time with new pipelines - and 8192 pipelines probed with no limit, the render thread spinning for good once
+// that one filled: the freeze after a long session, issues #21 / #33 / #35.)
+typedef struct { uint64_t key; void *val; } MapSlot;
+typedef struct { MapSlot *s; uint32_t cap, n; const char *name; } Map;
+static uint32_t map_start(uint32_t dflt) {  // (LARECOMP_VK_MAP_START=<n>: small tables, to test the growing)
+    const char *e = getenv("LARECOMP_VK_MAP_START");
+    uint32_t n = e && atoi(e) >= 8 ? (uint32_t)atoi(e) : dflt, c = 8;
+    while (c < n) c <<= 1;
+    return c;
+}
+static void *map_get(const Map *m, uint64_t key) {
+    if (!m->s) return NULL;
+    for (uint32_t i = (uint32_t)(key ^ (key >> 31)) & (m->cap - 1); m->s[i].key; i = (i + 1) & (m->cap - 1))
+        if (m->s[i].key == key) return m->s[i].val;
+    return NULL;
+}
+static void map_put(Map *m, uint64_t key, void *val, uint32_t start) {  // (key not in the table; nonzero)
+    if (!m->s || (m->n + 1) * 2 > m->cap) {
+        uint32_t cap = m->s ? m->cap * 2 : map_start(start);
+        MapSlot *s = calloc(cap, sizeof *s);
+        for (uint32_t i = 0; m->s && i < m->cap; i++) {
+            if (!m->s[i].key) continue;
+            uint32_t j = (uint32_t)(m->s[i].key ^ (m->s[i].key >> 31)) & (cap - 1);
+            while (s[j].key) j = (j + 1) & (cap - 1);
+            s[j] = m->s[i];
+        }
+        if (m->s) LOG("[vk] %s table: %u -> %u slots (%u entries)\n", m->name, m->cap, cap, m->n);
+        free(m->s);
+        m->s = s, m->cap = cap;
+    }
+    uint32_t i = (uint32_t)(key ^ (key >> 31)) & (m->cap - 1);
+    while (m->s[i].key) i = (i + 1) & (m->cap - 1);
+    m->s[i].key = key, m->s[i].val = val;
+    m->n++;
+}
+static void map_clear(Map *m) {
+    if (m->s) memset(m->s, 0, (size_t)m->cap * sizeof *m->s);
+    m->n = 0;
+}
+
+static Map prog_tab = {.name = "program"};
 
 // BindProgram(program, stages): the stages in the mask come from `program` (NULL: unbound), the others stay. A bind
 // that leaves one program's stages and nothing else uses that program itself (as before); a mix of stages from
@@ -1941,12 +1982,8 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
     h ^= fkey->velocity | (uint64_t)fkey->vel_rt << 8; h *= 0x100000001B3ull;
     if (!h) h = 1;
-    uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
-    for (int probe = 0; prog_tab[slot].key && prog_tab[slot].key != h; probe++) {
-        if (probe == 64) { prog_tab[slot].key = 0; break; }  // (full run of slots: the entry is replaced, its Prog kept)
-        slot = (slot + 1) & (PROG_TAB - 1);
-    }
-    if (prog_tab[slot].key) return prog_tab[slot].prog;
+    Prog *found = map_get(&prog_tab, h);
+    if (found) return found;
     {   // an address seen before with other code: the old address-only key would have handed back that shader
         static struct { uint64_t addr, content; } seen[8192];
         static uint64_t nother;
@@ -1966,8 +2003,7 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
         }
     }
     Prog *p = calloc(1, sizeof *p);
-    prog_tab[slot].key = h;
-    prog_tab[slot].prog = p;
+    map_put(&prog_tab, h, p, 4096);
     for (int i = 0; i < 2; i++) {
         p->code[i] = np->stages[i].code_addr;
         p->cmax[i] = np->stages[i].const_offset ? np->stages[i].const_offset : 0x10000;
@@ -2169,8 +2205,7 @@ typedef struct {
 } PipeKey;
 
 typedef struct { PipeKey k; uint64_t hash; VkPipeline pipe; _Atomic int state; } Pipe;  // state: 0 building, 1 ready, 2 failed
-#define PIPE_TAB 8192
-static struct { uint64_t key; Pipe *pipe; } pipe_tab[PIPE_TAB];
+static Map pipe_tab = {.name = "pipeline"};
 
 // 8 bytes a step (PipeKey is ~700 bytes, hashed per draw); in-memory tables only - hmix values are compared with
 // stored constants (fragment-shader hashes) and must not change.
@@ -2938,8 +2973,8 @@ static int g_cs_n;  // (compute program table below)
 // address (the old Prog / Pipe objects are leaked, so pipeline keys holding their pointers can't collide), compute
 // programs, shared copies - and the heap import: its pages are replaced (re-imported on first use).
 void vk_exec_reset(void) {
-    memset(prog_tab, 0, sizeof prog_tab);
-    memset(pipe_tab, 0, sizeof pipe_tab);
+    map_clear(&prog_tab);
+    map_clear(&pipe_tab);
     g_cs_n = 0;
     gpuw.n = gpur.n = 0;  // (guest memory is replaced)
     keep_drop_all();
@@ -3713,14 +3748,11 @@ static void draw_(CmdRec *r, bool indexed) {
     if (pr->fi->uses_shpcf) k.shadow_q = (uint8_t)g_settings.shadow_filter;
     uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
     if (!ph) ph = 1;
-    uint32_t pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
-    while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph) pslot = (pslot + 1) & (PIPE_TAB - 1);
-    Pipe *pp = pipe_tab[pslot].pipe;
+    Pipe *pp = map_get(&pipe_tab, ph);
     if (!pp) {
         pp = calloc(1, sizeof *pp);
         pp->k = k;
-        pipe_tab[pslot].key = ph;
-        pipe_tab[pslot].pipe = pp;
+        map_put(&pipe_tab, ph, pp, 8192);
         run_job(build_pipeline, pp);
     }
     wait_built(&pp->state);
