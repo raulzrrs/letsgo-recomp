@@ -623,9 +623,20 @@ static void *generate_thread(void *unused) {
         int n_in = count_files(WORK "/in");  // (the images with transparency: two each)
         PlatProc p = plat_spawn(argv, WORK "/waifu2x.log", false);
         int r = -1;
+        // (no new image for 3 minutes: stopped - the gentle pass on an AMD integrated GPU sat there for good, issue #30)
+        int last_made = -1;
+        uint64_t last_new = plat_now_ns();
         if (p)
             while ((r = plat_proc_wait(p, false)) == -1) {
-                g_progress = (float)count_files(WORK "/out") / (float)(n_in ? n_in : 1);
+                int now_made = count_files(WORK "/out");
+                g_progress = (float)now_made / (float)(n_in ? n_in : 1);
+                if (now_made != last_made) last_made = now_made, last_new = plat_now_ns();
+                else if (plat_now_ns() - last_new > 180000000000ull) {
+                    LOG("[ui2x] waifu2x: no new image in 3 minutes, stopped\n");
+                    plat_proc_kill(p);
+                    r = -2;
+                    break;
+                }
                 SDL_Delay(200);
             }
         int made = count_files(WORK "/out");

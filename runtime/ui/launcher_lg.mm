@@ -159,10 +159,10 @@ static void ui2x_section(bool ready, bool *on) {
                                            "A partir dos seus arquivos do jogo, com o waifu2x (baixado uma vez do GitHub, 35 MB). Leva alguns minutos e ocupa cerca de 1 GB em cache/."));
     if (st >= UI2X_FAIL_DOWNLOAD) {
         static const char *const en[] = {"Couldn't download the upscaler: check the connection.",
-                                         "The upscaler failed (details in lasrecomp.log): try again.",
+                                         "The upscaler doesn't work on this graphics card (details in lasrecomp.log). The game plays the same without it.",
                                          "Couldn't read the game files or write cache/."};
         static const char *const pt[] = {"Não foi possível baixar o ampliador: confira a conexão.",
-                                         "O ampliador falhou (detalhes no lasrecomp.log): tente de novo.",
+                                         "O ampliador não funciona nesta placa de vídeo (detalhes no lasrecomp.log). O jogo funciona igual sem ele.",
                                          "Não foi possível ler os arquivos do jogo ou gravar em cache/."};
         ImGui::PushTextWrapPos(0);
         ImGui::TextColored(UI_RED_TEXT, "%s", (g_pt ? pt : en)[st - UI2X_FAIL_DOWNLOAD]);
