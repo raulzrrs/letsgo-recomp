@@ -487,7 +487,7 @@ void ui_tabs_begin(int *current, int count) {
 
 // ------------------------------------------------------------------ the graphics page
 static const char *const *graphics_labels(int *n) {
-    static const char *l[8];
+    static const char *l[9];
     l[0] = UI_T("Frame rate limit", "Limite de quadros", "Лимит кадров");
     l[1] = UI_T("Ambient occlusion (SSAO)", "Oclusão de ambiente (SSAO)", "Затенение (SSAO)");
     l[2] = UI_T("Indirect light (GI)", "Luz indireta (GI)", "Непрямой свет (GI)");
@@ -496,7 +496,8 @@ static const char *const *graphics_labels(int *n) {
     l[5] = UI_T("FSR 3.1 mode", "Modo do FSR 3.1", "Режим FSR 3.1");
     l[6] = UI_T("Frame generation", "Geração de quadros", "Генерация кадров");
     l[7] = UI_T("Sharpening (AMD RCAS)", "Nitidez (AMD RCAS)", "Резкость (AMD RCAS)");
-    *n = 8;
+    l[8] = UI_T("Show FPS", "Mostrar FPS", "Показывать FPS");
+    *n = 9;
     return l;
 }
 
@@ -527,6 +528,11 @@ void ui_page_graphics(float x, bool known) {
                              "Mundo a 60 ou 120 fps; menus, Pokédex, batalhas e capturas continuam a 30.",
                              "Мир на 60 или 120 к/с; меню, Покедекс, бои и поимки остаются на 30."));
     }
+    // the FPS counter in a corner of the game (runtime/ui/menu.mm), issue #34
+    ui_toggle("##show_fps", l[8], x, &g_settings.show_fps);
+    ui_tip(UI_T("The frame rate in a corner of the screen while playing.",
+                "A taxa de quadros num canto da tela durante o jogo.",
+                "Частота кадров в углу экрана во время игры."));
     ui_group_gap();
     // SSAO and GI by quality level (their parameters: settings_apply_levels; high = what they had before the levels)
     const char *lv[] = {UI_T("Off", "Desligado", "Выкл."), UI_T("Low", "Baixo", "Низкое"), UI_T("Medium", "Médio", "Среднее"),
