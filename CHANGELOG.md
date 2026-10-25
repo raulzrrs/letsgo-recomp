@@ -1,13 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.7.6 (2026-10-25)
 
+- **Fix: the game froze after a long session** (issues #21, #33, #35): two of the renderer's tables were fixed in size;
+  once the pipeline one filled, the render thread spun for good. They now grow.
+- **Fix: "Make the 2x images" could sit there for good** on an AMD integrated GPU (issue #30): with no new image for 3
+  minutes it stops and says the upscaler doesn't work on that card (the game plays the same without it).
+- **Show FPS** on the Graphics page (launcher and F12): the frame rate counter in a corner (issue #34).
+- The log starts with the port's version.
 - **Eevee 1.0.2 (the update) gets every option**: 60 / 120 fps, wild battles and skipping the controller screen were
   only for 1.0.0; the runtime's hooks and the generator's patches now have the 1.0.2 addresses too. Pikachu 1.0.2
   isn't covered yet. The game code is rebuilt once on the first start after updating.
-
-## 0.7.6 (2026-10-25)
-
 - **Fix: losing a wild battle left the player where they were, with the party fainted** (and the next battle ended at
   once). It now blacks out as the game does after any lost battle: the last Pokémon Center, or home, the party healed.
 - **Fix: at 60 fps, ghosts in menus and maps** (the towns' icons on the Pokédex's habitat map, the save screen's

@@ -849,3 +849,30 @@ Pedido: capturar a qualquer momento da batalha, mais fácil com o selvagem fraco
 - **Consequência.** O `GAMELIB_ID` inclui o gerador (`tools/patches.py`): a release com isso recompila o código do jogo
   de todo mundo na primeira abertura, inclusive no 1.0.0.
 - **Falta.** Pikachu 1.0.2 (build `c208db6a4ef4361f`, do log da issue #1): precisa do `main` dele para mapear.
+
+## Issues #21 / #33 / #35: o jogo congelava depois de uma sessão longa (25/10/2026)
+- **Relatos.** #21 (RX 6600 XT): "trava depois de uns 10 minutos", 4 vezes; #35 (o mesmo jogador): a imagem pisca e
+  o jogo congela; #33 (GeForce 930M): congela numa cutscene com a música tocando.
+- **Assinatura nos logs.** Os três acabam sem erro nenhum, com 16.184 / 16.302 / 16.488 compilações somadas na sessão.
+  Pouco antes do fim, as linhas de 2 s mostram "compile 240 ... glsl cache 240 read, 0 stored" sem parar (#35: 480): os
+  mesmos programas tirados do cache em disco e compilados de novo a cada quadro.
+- **Causa** (`runtime/nvn/vulkan/exec.c`). A tabela de programas tinha 4096 posições com sondagem linear e, depois de
+  64 posições cheias, substituía a entrada (o `Prog` velho vazava): com a tabela carregada, dois programas passavam a
+  se expulsar a cada quadro. Cada programa recriado tem outro ponteiro, e o ponteiro faz parte da chave do pipeline:
+  pipelines novos a cada quadro. A tabela de pipelines (8192) sondava **sem limite**: cheia, o laço não termina e a
+  thread de renderização gira para sempre - o congelamento. ~8 mil programas + ~8 mil pipelines = os ~16 mil dos logs.
+- **Correção.** As duas tabelas dobram ao chegar à metade (`Map`, `map_get` / `map_put`), sem substituir nem girar; o
+  log diz quando crescem ("[vk] program table: 4096 -> 8192 slots"). `LARECOMP_VK_MAP_START=<n>` começa pequeno, para
+  testar: com 8, cresceram até 2048 numa sessão com mundo a 60 fps e batalha selvagem, imagens normais.
+- **Junto.** O log começa com a versão do port ("[paths] Let's Go Recomp 0.7.6, data: ..."): nos logs das issues ela
+  tinha de ser deduzida pelas mensagens.
+
+## Issue #30: "Gerar as imagens em 2x" parado para sempre numa AMD integrada (25/10/2026)
+- **Log.** Na primeira passada o waifu2x devolveu imagens erradas (2986 de 3081) e o nosso trabalho de GPU passou de 10 s;
+  a segunda, com blocos pequenos (0.7.2), começou e não saiu mais nada: o launcher ficou na barra de progresso.
+- **Correção** (`runtime/ui2x.c`). Sem imagem nova em 3 minutos, o waifu2x é encerrado e a geração termina como falha;
+  o aviso agora diz que o ampliador não funciona nesta placa e que o jogo funciona igual sem ele.
+
+## Issue #34: mostrar o FPS pelo menu (25/10/2026)
+- O contador já existia (`show_fps` no `larecomp.ini`, `runtime/ui/menu.mm`), sem opção na interface. Agora é "Mostrar
+  FPS" na página Gráficos (launcher e F12).
