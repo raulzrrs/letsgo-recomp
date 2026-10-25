@@ -4,7 +4,8 @@
                   [VAR=value ...]          one session: walks back and forth in the grass, looped; inside an encounter
                                            input.c presses B to run away; (LARECOMP_INPUT_LOOP); after each battle /
                                            capture it holds still for 300 frames (input.c) so the view can be compared
-                                           with the one before the encounter; EXE=<path> runs another build
+                                           with the one before the encounter; EXE=<path> runs another build,
+                                           DATA=<folder> another data root (an install's extracted/)
   capture_loop.py scan <name>              per encounter: the frame before it against the frame after the world is back
                                            (luma, 4 px tolerance: % of pixels off by > 24) and build/capture_loop/<name>/
                                            pairs_NN.png (before | after, 4 encounters per image) to look at
@@ -65,7 +66,7 @@ def run(name, game, frames, save, fps, turbo, extra, leg=80):
     env['PATH'] = 'C:/msys64/ucrt64/bin;C:/msys64/usr/bin;' + env.get('PATH', '')
     if turbo:
         env['LARECOMP_FPS'] = '0'
-    root = 'extracted'
+    root = extra.pop('DATA', 'extracted')  # (DATA=<folder>: another install's data root, e.g. a release set up with an update)
     if game == 'pikachu':
         root = 'extracted-pikachu'
         env['LARECOMP_GAME_LIB'] = os.path.join(ROOT, 'extracted-pikachu', 'lasgame.dll')
