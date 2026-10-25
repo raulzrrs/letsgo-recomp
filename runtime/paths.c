@@ -119,7 +119,7 @@ void rt_paths_init(void) {
         fail(msg);
     }
     if (!getcwd(g_root, sizeof g_root)) snprintf(g_root, sizeof g_root, "%s", root);
-    fprintf(stderr, "[paths] data: %s\n", g_root);
+    fprintf(stderr, "[paths] " RT_APP_NAME " " RT_APP_VERSION ", data: %s\n", g_root);  // (the version: issue logs)
 }
 
 const char *rt_data_root(void) { return g_root; }
