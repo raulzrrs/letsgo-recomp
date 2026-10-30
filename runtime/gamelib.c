@@ -71,8 +71,9 @@ bool gamelib_present(const char *game_dir) {
     if (g_tables) return true;
     char c[3][1100];
     int n = candidates(game_dir, c);
-    for (int i = 0; i < n; i++)
-        if (exists(c[i]) && id_matches(c[i])) return true;
+    const char *env = getenv("LARECOMP_GAME_LIB");
+    for (int i = 0; i < n; i++)  // (LARECOMP_GAME_LIB: taken as given, as gamelib_load does; its own id is checked there)
+        if (exists(c[i]) && ((i == 0 && env && *env) || id_matches(c[i]))) return true;
     return false;
 }
 

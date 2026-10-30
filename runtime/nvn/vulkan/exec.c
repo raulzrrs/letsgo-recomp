@@ -1,8 +1,15 @@
 // Executes recorded NVN command lists with Vulkan (port of renderer.m; same structure, same behaviour).
 #include <SDL3/SDL_cpuinfo.h>
+#if defined(__x86_64__)
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <SDL3/SDL_timer.h>
 #include <float.h>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include <math.h>
 #include <stdarg.h>
 #include <pthread.h>
@@ -35,6 +42,10 @@ static uint64_t stat_upload_bytes;
 static int prof = -1;
 static uint64_t prof_exec, prof_draw, prof_sets, prof_vtx, prof_submit, prof_pre, prof_key, prof_dyn, prof_tex, prof_up, prof_gpu, prof_ipc;
 static VkQueryPool prof_qp;
+// GPU time of the submissions (their first and last timestamps), with LARECOMP_VK_PROF or the performance overlay on:
+// its share of the time is the overlay's GPU use (ui/menu.mm)
+static _Atomic uint64_t gpu_busy_ns;
+uint64_t renderer_gpu_busy_ns(void) { return gpu_busy_ns; }
 static uint64_t cum_exec, cum_wait, cum_draws, cum_submits;  // (profiling) never reset: hitch log
 static uint32_t prof_end_line[4096];  // passes ended, by the exec.c line that ended them (0: submit / present)
 uint64_t prof_views_created;  // textures.c vk_image_view cache misses
@@ -70,6 +81,11 @@ static int cur_sub;
 static uint64_t submit_seq;  // last submitted
 static pthread_mutex_t seq_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool in_pass;
+// Deferred clears (clear_defer, below): pending until the next pass takes them as its load op, or recorded on their own
+// before anything else reaches the command buffer (vk_cmd)
+static int pclear_n;
+static bool pclear_hold;
+static void pclear_flush(void);
 
 uint64_t vk_completed_seq(void) {
     uint64_t v = 0;
@@ -77,14 +93,33 @@ uint64_t vk_completed_seq(void) {
     return v;
 }
 
-void vk_wait_seq(uint64_t seq) {
+// LARECOMP_VK_PROF: the GPU waits by caller in the stats line ("waits": offset in this library for addr2line: ms/count)
+static struct { uintptr_t ra; uint64_t ns, n; } wsite[16];
+void vk_wait_sites_log(char *out, size_t cap) {
+    uintptr_t base = 0;  // (Windows: absolute addresses)
+#ifndef _WIN32
+    Dl_info di = {0};
+    if (dladdr((void *)vk_wait_sites_log, &di)) base = (uintptr_t)di.dli_fbase;
+#endif
+    size_t o = 0;
+    for (int i = 0; i < 16 && wsite[i].ra; i++) {
+        o += (size_t)snprintf(out + o, o < cap ? cap - o : 0, " %lx:%.0fms/%llu", (unsigned long)(wsite[i].ra - base),
+                              wsite[i].ns / 1e6, (unsigned long long)wsite[i].n);
+        wsite[i].ns = wsite[i].n = 0;
+    }
+}
+
+__attribute__((noinline)) void vk_wait_seq(uint64_t seq) {
     if (!seq) return;
+    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
                               .pValues = &seq};
     uint64_t t0 = SDL_GetTicksNS();
     VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
     stat_wait_ns += SDL_GetTicksNS() - t0;
     cum_wait += SDL_GetTicksNS() - t0;
+    for (int i = 0; i < 16; i++)
+        if (wsite[i].ra == ra || !wsite[i].ra) { wsite[i].ra = ra; wsite[i].ns += SDL_GetTicksNS() - t0; wsite[i].n++; break; }
     if (r == VK_TIMEOUT) LOG("[vk] GPU did not finish submission %llu within 10 s (device lost?)\n", (unsigned long long)seq);
     else if (r != VK_SUCCESS) {
         extern void vk_devlost_dump(void);
@@ -102,8 +137,11 @@ static Sub *sub(void) {
         vk_wait_seq(s->seq);
         if (s->ts) {  // (profiling) GPU time of that submission
             uint64_t t[2];
-            if (vkGetQueryPoolResults(g_vk.dev, prof_qp, (uint32_t)cur_sub * 2, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
-                prof_gpu += (uint64_t)((double)(t[1] - t[0]) * g_vk.props.limits.timestampPeriod);
+            if (vkGetQueryPoolResults(g_vk.dev, prof_qp, (uint32_t)cur_sub * 2, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0]) {
+                uint64_t ns = (uint64_t)((double)(t[1] - t[0]) * g_vk.props.limits.timestampPeriod);
+                prof_gpu += ns;
+                gpu_busy_ns += ns;
+            }
             s->ts = false;
         }
         for (int i = 0; i < s->npools; i++) vkResetDescriptorPool(g_vk.dev, s->pools[i], 0);
@@ -132,11 +170,12 @@ static void begin_cb(VkCommandBuffer *cb, bool *begun) {
 
 static void gp_mark(VkCommandBuffer cb, const char *fmt, ...);
 VkCommandBuffer vk_cmd(void) {
+    if (pclear_n && !pclear_hold) pclear_flush();  // (whatever comes now may read or write a target cleared before it)
     Sub *s = sub();
     if (!s->main_begun) {
         begin_cb(&s->main, &s->main_begun);
         gp_mark(s->main, "(submission start; includes GPU idle before it)");
-        if (prof && prof_qp) {
+        if ((prof || g_settings.show_fps) && prof_qp) {
             vkCmdResetQueryPool(s->main, prof_qp, (uint32_t)cur_sub * 2, 2);
             vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_NONE, prof_qp, (uint32_t)cur_sub * 2);
             s->ts = true;
@@ -245,6 +284,8 @@ static void gp_mark(VkCommandBuffer cb, const char *fmt, ...) {
     gp_draws[gp_n] = 0;
     gp_n++;
 }
+// (fsr3.cpp: a row per FidelityFX dispatch in a profiled frame)
+void vk_gp_mark_str(VkCommandBuffer cb, const char *s) { gp_mark(cb, "%s", s); }
 void renderer_flush(void);
 void vk_gpuprof_report(void) {
     if (!gp_n) return;
@@ -379,8 +420,9 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
 
 // ================================================================== transient memory ring
 // The largest index of a draw (bounds the vertex data copied for it), ignoring the restart value: AVX2 where the CPU has it (the
-// game code needs it too), a plain loop elsewhere. A draw scans a few thousand indices: ~1.4 us scalar, ~0.15 us here.
-__attribute__((target("avx2"))) static uint32_t scan_max16_avx2(const uint16_t *q, uint32_t n, uint16_t restart) {
+// game code needs it too), NEON on AArch64, a plain loop elsewhere. A draw scans a few thousand indices: ~1.4 us scalar, ~0.15 us here.
+#if defined(__x86_64__)
+__attribute__((target("avx2"))) static uint32_t scan_max16_simd(const uint16_t *q, uint32_t n, uint16_t restart) {
     __m256i acc = _mm256_setzero_si256(), rs = _mm256_set1_epi16((short)restart);
     uint32_t i = 0;
     for (; i + 16 <= n; i += 16) {
@@ -394,7 +436,7 @@ __attribute__((target("avx2"))) static uint32_t scan_max16_avx2(const uint16_t *
     for (; i < n; i++) if (q[i] != restart && q[i] > m) m = q[i];
     return m;
 }
-__attribute__((target("avx2"))) static uint32_t scan_max32_avx2(const uint32_t *q, uint32_t n, uint32_t restart) {
+__attribute__((target("avx2"))) static uint32_t scan_max32_simd(const uint32_t *q, uint32_t n, uint32_t restart) {
     __m256i acc = _mm256_setzero_si256(), rs = _mm256_set1_epi32((int)restart);
     uint32_t i = 0;
     for (; i + 8 <= n; i += 8) {
@@ -408,16 +450,46 @@ __attribute__((target("avx2"))) static uint32_t scan_max32_avx2(const uint32_t *
     for (; i < n; i++) if (q[i] != restart && q[i] > m) m = q[i];
     return m;
 }
+#elif defined(__aarch64__)
+static uint32_t scan_max16_simd(const uint16_t *q, uint32_t n, uint16_t restart) {
+    uint16x8_t acc = vdupq_n_u16(0), rs = vdupq_n_u16(restart);
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint16x8_t v = vld1q_u16(q + i);
+        acc = vmaxq_u16(acc, vbicq_u16(v, vceqq_u16(v, rs)));
+    }
+    uint32_t m = vmaxvq_u16(acc);
+    for (; i < n; i++) if (q[i] != restart && q[i] > m) m = q[i];
+    return m;
+}
+static uint32_t scan_max32_simd(const uint32_t *q, uint32_t n, uint32_t restart) {
+    uint32x4_t acc = vdupq_n_u32(0), rs = vdupq_n_u32(restart);
+    uint32_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        uint32x4_t v = vld1q_u32(q + i);
+        acc = vmaxq_u32(acc, vbicq_u32(v, vceqq_u32(v, rs)));
+    }
+    uint32_t m = vmaxvq_u32(acc);
+    for (; i < n; i++) if (q[i] != restart && q[i] > m) m = q[i];
+    return m;
+}
+#endif
 static uint32_t scan_max_index_(const void *src, uint32_t isz, uint32_t n, uint32_t restart) {
-    static int avx2 = -1;
-    if (avx2 < 0) avx2 = __builtin_cpu_supports("avx2");
+#if defined(__x86_64__)
+    static int simd = -1;
+    if (simd < 0) simd = __builtin_cpu_supports("avx2");
+#elif defined(__aarch64__)
+    const int simd = 1;
+#else
+    const int simd = 0;
+#endif
     uint32_t m = 0;
     if (isz == 2) {
-        if (avx2) return scan_max16_avx2(src, n, (uint16_t)restart);
+        if (simd) return scan_max16_simd(src, n, (uint16_t)restart);
         const uint16_t *q = src;
         for (uint32_t i = 0; i < n; i++) if (q[i] > m && q[i] != (uint16_t)restart) m = q[i];
     } else {
-        if (avx2) return scan_max32_avx2(src, n, restart);
+        if (simd) return scan_max32_simd(src, n, restart);
         const uint32_t *q = src;
         for (uint32_t i = 0; i < n; i++) if (q[i] > m && q[i] != restart) m = q[i];
     }
@@ -451,7 +523,9 @@ static bool ring_gpu_enabled(void) {
         if (!e) e = g_settings.vertex_read == VREAD_DIRECT ? "direct" : g_settings.vertex_read == VREAD_COPY ? "copy" : NULL;
         if (e && !strcmp(e, "direct")) on = 0;
         else if (e && (!strcmp(e, "copy") || !strcmp(e, "hybrid"))) on = 1;
-        else on = g_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+        // (Android, the memory pools in GPU memory: uncached, slow for the GPU's vertex fetch - the world's frame took twice the
+        // GPU time read in place - and every buffer copy of the game waited for the GPU to be idle, 15 a frame)
+        else on = g_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || g_vk.heap_export;
         LOG("[vk] vertex and index data: %s\n", on ? "copied to VRAM (ranges the GPU writes are read in place)" : "read in place from the game's memory");
     }
     return on;
@@ -673,7 +747,11 @@ static void acopy_drain(void) {
     if (atomic_load(&acq_done) >= want) return;
     PROF_T0();
     while (acopy_take_one()) {}
+#if defined(__x86_64__)
     while (atomic_load(&acq_done) < want) __builtin_ia32_pause();
+#else
+    while (atomic_load(&acq_done) < want) __asm__ volatile("yield");
+#endif
     PROF_ADD(prof_gcpy_wait_ns);
 }
 static void acopy_push(void *dst, const void *src, uint64_t n) {
@@ -998,6 +1076,25 @@ static bool ip_enabled(void) {
     return g_settings.frame_gen >= FG_AUTO || ip_on > 0 || fps60_menu();
 }
 static const void *ip_cbuf(int stage, int k, uint64_t addr, uint32_t size);
+static bool ssao_proj_at(const float *m, float out[4]);  // (a perspective projection: below)
+// Wide screens (runtime/hle/widescreen.c): a copy of a vertex constant block whose 16:9 perspective projections (in its
+// first 512 bytes) take the window's aspect - their P00 scaled by 16/9 / aspect; NULL when off or none there. The
+// camera the effects read (occlusion, indirect light, motion vectors), as the draws are widened (ShaderKey.widen).
+static const uint8_t *wide_block(const uint8_t *src, uint32_t size) {
+    extern float widescreen_aspect(void);
+    float wa = widescreen_aspect();
+    if (wa <= 1.0f || !src || size > 0x1000) return NULL;
+    static uint8_t buf[0x1000];
+    bool any = false;
+    for (uint32_t o = 0; o + 64 <= size && o < 512; o += 16) {
+        const float *m = (const float *)(src + o);
+        float pj[4];
+        if (!ssao_proj_at(m, pj) || fabsf(pj[1] / pj[0] - 16.0f / 9.0f) > 0.01f) continue;
+        if (!any) memcpy(buf, src, size), any = true;
+        ((float *)(buf + o))[0] = m[0] * (16.0f / 9.0f) / wa;
+    }
+    return any ? buf : NULL;
+}
 static void ip_note_list(uint64_t handle);
 static bool ip_skip_op(uint32_t op) {  // what the replay must not do again: it writes guest memory or signals the game
     switch (op) {
@@ -1139,6 +1236,10 @@ const char *renderer_stats(void) {
             }
         memset(prof_op_ns, 0, sizeof prof_op_ns);
         memset(prof_op_n, 0, sizeof prof_op_n);
+        n = strlen(stats_text);
+        snprintf(stats_text + n, sizeof stats_text - n, " | waits:");
+        n = strlen(stats_text);
+        vk_wait_sites_log(stats_text + n, sizeof stats_text - n);
         prof_tex_checks = prof_tex_samples = prof_tex_full = prof_tex_full_bytes = prof_tex_dyn = 0;
         prof_exec = prof_draw = prof_sets = prof_vtx = prof_submit = prof_pre = prof_key = prof_dyn = prof_tex = prof_up = prof_gpu = prof_ipc = 0;
     }
@@ -1163,8 +1264,8 @@ static void st_defaults(void) {
 
 void vk_exec_init(void) {
     prof = getenv("LARECOMP_VK_PROF") != NULL;
-    if (prof) {
-        prof_up_ns = 0;
+    prof_up_ns = 0;
+    {   // (the submissions' timestamps: LARECOMP_VK_PROF, the performance overlay)
         VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = SUBS * 2};
         if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &prof_qp) != VK_SUCCESS) prof_qp = VK_NULL_HANDLE;
     }
@@ -1181,6 +1282,7 @@ uint64_t renderer_present_count(void);
 void renderer_save_texture_tex(TexBackend *b, const char *path);
 static float pass_sx = 1, pass_sy = 1;
 static float vp_sx = 1, vp_sy = 1, vp_ox = 0, vp_oy = 0;
+static int g_wide_ui;  // wide screens: this draw's interface placement (ShaderKey.widen's wide_.y)
 static float tex_sc[2][64][2];
 static uint32_t tex_wh[2][64][2];
 
@@ -1243,6 +1345,7 @@ static uint64_t ui_final_frame;
 static VkImageView raw_view(TexBackend *b);
 static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_);
 static bool fsr3_on(void);
+static bool gsr2_on(void);
 // Mip bias of the game's own textures while TAA or FSR 3.1 resolves the image (post_process_ex, texture_info): the
 // temporal accumulation brings back the detail of a finer mip level without its shimmer - AMD's guidance for FSR,
 // log2(render / display width) - 1 (native: -1; Quality, 1.5x: -1.58); TAA at native -0.5 (its history is shorter).
@@ -1263,7 +1366,7 @@ static bool mv_wanted(void) {
     static int dump = -1;
     if (dump < 0) dump = getenv("LARECOMP_MV_DUMP") != NULL;
     return g_settings.mv_debug || dump || (g_settings.ssao && g_settings.ssao_temporal) || (g_settings.gi && g_settings.gi_temporal) ||
-           g_settings.antialias == AA_TAA || g_settings.upscaler == UPSCALE_FSR3 ||
+           AA_ON(g_settings.antialias) == AA_TAA || UPSCALE_TEMPORAL(g_settings.upscaler) ||
            (g_settings.frame_gen && g_settings.fg_method == FG_FLOW);  // (the optical flow starts from them: flow_prepare)
 }
 
@@ -1319,15 +1422,153 @@ static void vk_end_pass_at(int line) {
 
 static uint32_t level_extent(uint32_t v, uint32_t lv) { v >>= lv; return v ? v : 1; }
 
+// ---- Deferred clears. The game clears a target in a pass of its own (a depth-only target, then the scene's colour
+// and that depth: 6 - 8 such passes a frame in the world), each its own render pass: on a tiler the cleared image is
+// written to memory, and the next pass loads it back. A whole-target clear with no pass open is kept here instead and
+// becomes the load op (CLEAR) of the next pass that renders to the same target at the same size - nothing written or
+// read for it. Anything else first (another pass without that target, a copy, a dispatch, our passes, a submission:
+// all reach vk_cmd) records the pending clears as they were, in order. Measured on the phone (Adreno 830, world):
+// ~5 % of the frame's GPU time in those passes. LARECOMP_DEFER_CLEARS=0: each its own pass (comparison).
+typedef struct {
+    NvnTexture *t;
+    TexBackend *b;
+    NvnTextureView view;
+    bool has_view, color;
+    VkImageAspectFlags aspects;  // (depth / stencil: which of them)
+    VkClearValue v;
+    uint32_t w, h;  // (the level's extent: the pass taking it must render all of it)
+} PClear;
+static PClear pclear[9];
+
+static PClear *pclear_find(NvnTexture *t, const NvnTextureView *view, bool has_view, bool color) {
+    for (int i = 0; i < pclear_n; i++) {
+        PClear *p = &pclear[i];
+        if (p->t == t && p->color == color && p->has_view == has_view && (!has_view || !memcmp(&p->view, view, sizeof *view))) return p;
+    }
+    return NULL;
+}
+static void pclear_drop(PClear *p) { *p = pclear[--pclear_n]; }
+
+// (textures.c: a target's image destroyed - its pending clear goes with it)
+void vk_pclear_forget(TexBackend *b) {
+    for (int i = 0; i < pclear_n;)
+        if (pclear[i].b == b) pclear_drop(&pclear[i]); else i++;
+}
+
+static void pclear_flush(void) {
+    if (!pclear_n) return;
+    pclear_hold = true;
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    for (int i = 0; i < pclear_n; i++) {
+        PClear *p = &pclear[i];
+        VkImageView v = vk_view(p->t, &p->view, p->has_view, true, TEXTYPE_2D);
+        if (!v) continue;
+        VkRenderingAttachmentInfo a = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v,
+                                       .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                       .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = p->v};
+        VkRenderingAttachmentInfo da = a, sa = a;
+        VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {p->w, p->h}}, .layerCount = 1};
+        if (p->color) ri.colorAttachmentCount = 1, ri.pColorAttachments = &a;
+        else {
+            if (!(p->aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            if (!(p->aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) sa.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            if (p->b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ri.pDepthAttachment = &da;
+            if (p->b->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ri.pStencilAttachment = &sa;
+        }
+        vkCmdBeginRendering(cb, &ri);
+        vkCmdEndRendering(cb);
+    }
+    vk_full_barrier(cb);
+    pclear_n = 0;
+    pclear_hold = false;
+}
+
+// The current target's attachment (colour index, or -1: depth) and its level's extent; false when it has none
+static bool rt_attachment(int index, NvnTexture **t, uint32_t *w, uint32_t *h, uint32_t *gw, uint32_t *gh) {
+    NvnTexture *x = index >= 0 ? st.rt.color[index] : st.rt.depth;
+    if (!x || !x->backend) return false;
+    bool hv = index >= 0 ? st.rt.has_cview[index] : st.rt.has_dview;
+    const NvnTextureView *v = index >= 0 ? &st.rt.cview[index] : &st.rt.dview;
+    uint32_t lv = hv && (v->setmask & 1) ? v->base_level : 0;
+    TexBackend *b = x->backend;
+    *t = x, *w = level_extent(b->width, lv), *h = level_extent(b->height, lv);
+    *gw = level_extent(x->width, lv), *gh = level_extent(x->height, lv);
+    return true;
+}
+
+// A clear (clear(), its arguments) with no pass open kept as pending: true when kept. Only what the pass would have
+// done exactly: a whole clear (all channels, the scissor over the whole target), every attachment of the target the
+// same size; the colour targets' first-use clears of begin_pass (renderer_texture_*_fresh: the alpha) kept with it.
+static bool clear_defer(int index, const void *color, uint32_t mask, bool depth, float dval, bool stencil, uint32_t sval, uint32_t smask) {
+    static int on = -1;
+    if (on < 0) on = getenv("LARECOMP_DEFER_CLEARS") ? atoi(getenv("LARECOMP_DEFER_CLEARS")) : 1;
+    if (!on || (in_pass && !st.rt_dirty)) return false;
+    if (!((index < 0 || (mask & 0xF) == 0xF) && (!stencil || (smask & 0xFF) == 0xFF))) return false;
+    if (index >= 0 ? index >= st.rt.ncolor || !st.rt.color[index] : !st.rt.depth || !(depth || stencil)) return false;
+    if (st.rt.depth && !renderer_format_is_depth(st.rt.depth->format)) return false;
+    uint32_t w = 0, h = 0, gw = 0, gh = 0;
+    for (int i = -1; i < st.rt.ncolor; i++) {
+        NvnTexture *t;
+        uint32_t aw, ah, agw, agh;
+        if (!rt_attachment(i, &t, &aw, &ah, &agw, &agh)) continue;
+        if (!vk_view(t, i >= 0 ? &st.rt.cview[i] : &st.rt.dview, i >= 0 ? st.rt.has_cview[i] : st.rt.has_dview, true, TEXTYPE_2D))
+            return false;
+        if (w && (aw != w || ah != h)) return false;
+        w = aw, h = ah, gw = agw, gh = agh;
+    }
+    if (!w) return false;
+    int64_t x = st.scissor[0][0], y = st.scissor[0][1];
+    if (x > 0 || y > 0 || x + st.scissor[0][2] < (int64_t)gw || y + st.scissor[0][3] < (int64_t)gh) return false;
+    if (pclear_n + st.rt.ncolor + 1 > (int)(sizeof pclear / sizeof *pclear)) pclear_flush();
+    vk_end_pass();  // (a pass of another target still open: ended, as begin_pass would)
+    for (int i = -1; i < st.rt.ncolor; i++) {
+        NvnTexture *t;
+        uint32_t aw, ah, agw, agh;
+        if (!rt_attachment(i, &t, &aw, &ah, &agw, &agh)) continue;
+        renderer_mark_gpu_owned(t);
+        const NvnTextureView *v = i >= 0 ? &st.rt.cview[i] : &st.rt.dview;
+        bool hv = i >= 0 ? st.rt.has_cview[i] : st.rt.has_dview;
+        VkClearValue cv = {0};
+        VkImageAspectFlags as = 0;
+        if (i >= 0) {  // (begin_pass's first-use clear: its alpha; the game's own clear over it)
+            bool fresh = (int)renderer_texture_level_fresh(t) | (int)renderer_texture_frame_fresh(t);
+            bool first = renderer_texture_first_write(t) || fresh;
+            if (i == index) memcpy(cv.color.float32, color, 16);
+            else if (first) cv.color.float32[3] = fresh ? 0.0f : 1.0f;
+            else continue;
+        } else {
+            TexBackend *b = t->backend;
+            as = (depth && (b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
+                 (stencil && (b->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+            if (index >= 0 || !as) continue;
+            cv.depthStencil = (VkClearDepthStencilValue){dval, sval};
+        }
+        PClear *p = pclear_find(t, v, hv, i >= 0);
+        if (!p) {
+            p = &pclear[pclear_n++];
+            *p = (PClear){.t = t, .b = t->backend, .view = *v, .has_view = hv, .color = i >= 0, .w = aw, .h = ah};
+        }
+        if (i >= 0) p->v = cv;
+        else {  // (a depth clear and a stencil clear one after the other: both)
+            if (as & VK_IMAGE_ASPECT_DEPTH_BIT) p->v.depthStencil.depth = dval;
+            if (as & VK_IMAGE_ASPECT_STENCIL_BIT) p->v.depthStencil.stencil = sval;
+            p->aspects |= as;
+        }
+    }
+    return true;
+}
+
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     vk_end_pass();
     // TAA: the scene is complete when the game moves on to another colour target (its bloom): resolved there, once
-    if ((jitter_on() || g_settings.upscaler == UPSCALE_FSR3) && ao.tex && ao.frame == fx_frame() && ao.taa_frame != ao.frame && ao.opaque >= 16 &&
+    if ((jitter_on() || g_settings.upscaler == UPSCALE_FSR3 || UPSCALE_IS_DITTOSR(g_settings.upscaler) || UPSCALE_IS_FSR4(g_settings.upscaler)) && ao.tex && ao.frame == fx_frame() && ao.taa_frame != ao.frame && ao.opaque >= 16 &&
         st.rt.ncolor && st.rt.color[0] && st.rt.color[0] != ao.tex)
         taa_run();
     if (dl_on == 2) renderer_flush();  // (LARECOMP_VK_DEVLOST_TRACE=2: each pass its own submission)
     st.rt_dirty = false;
+    pclear_hold = true;  // (the pending clears: this pass's load ops, or recorded before it - below)
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);  // passes, copies and dispatches see each other's results
     {
@@ -1403,6 +1644,25 @@ static void begin_pass(void) {
     }
     if (!w) { pass_sx = pass_sy = 1; minw = minh = 16; }
     pass_w = minw; pass_h = minh;
+    if (pclear_n) {  // (clear_defer: this pass's targets' pending clears are its load ops; the others recorded first)
+        for (int i = -1; i < (int)pass_ncolor; i++) {
+            if (i >= 0 ? !ca[i].imageView : !has_d && !has_s) continue;
+            NvnTexture *t = i >= 0 ? st.rt.color[i] : st.rt.depth;
+            PClear *p = pclear_find(t, i >= 0 ? &st.rt.cview[i] : &st.rt.dview, i >= 0 ? st.rt.has_cview[i] : st.rt.has_dview, i >= 0);
+            if (!p || p->w != minw || p->h != minh) continue;
+            if (i >= 0) ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, ca[i].clearValue = p->v;
+            else {
+                if (has_d && (p->aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, da.clearValue = p->v;
+                if (has_s && (p->aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) sa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, sa.clearValue = p->v;
+                if ((p->aspects & VK_IMAGE_ASPECT_DEPTH_BIT) && !has_d) continue;  // (an aspect this pass lacks: recorded)
+                if ((p->aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && !has_s) continue;
+            }
+            pclear_drop(p);
+        }
+        pclear_hold = false;
+        pclear_flush();
+    }
+    pclear_hold = false;
     ao.qual = false;
     if ((g_settings.ssao || g_settings.gi || g_settings.contact_on || mv_wanted()) && pass_ncolor && ca[0].imageView && has_d && pass_samples == 1 && st.rt.color[0]) {  // (TAA: mv_wanted)
         TexBackend *c0 = st.rt.color[0]->backend;
@@ -1457,6 +1717,11 @@ static VkRect2D scissor_rect(void) {
     pass_size(&w, &h);
     if (!w) return (VkRect2D){{0, 0}, {pass_w, pass_h}};
     int x = st.scissor[0][0], y = st.scissor[0][1], sw = st.scissor[0][2], sh = st.scissor[0][3];
+    // (wide screens, the interface placed by its vertex shader: a scissor over the whole screen is the whole image's -
+    // what reaches the window's sides is drawn there; a smaller one, the box's)
+    if (g_wide_ui && st.rt.ncolor && st.rt.color[0] && x <= 0 && y <= 0 && (int64_t)x + sw >= (int64_t)st.rt.color[0]->width &&
+        (int64_t)y + sh >= (int64_t)st.rt.color[0]->height)
+        return (VkRect2D){{0, 0}, {(uint32_t)(w < (int)pass_w ? w : (int)pass_w), (uint32_t)(h < (int)pass_h ? h : (int)pass_h)}};
     if (vp_sx != 1 || vp_sy != 1 || vp_ox != 0 || vp_oy != 0) {
         double x0 = floor(x * (double)vp_sx + vp_ox), y0 = floor(y * (double)vp_sy + vp_oy);
         double x1 = ceil(((double)x + sw) * vp_sx + vp_ox), y1 = ceil(((double)y + sh) * vp_sy + vp_oy);
@@ -1587,6 +1852,7 @@ static VkPipeline clear_pipeline(int index, int kind, uint32_t mask, bool depth,
 
 static void clear(int index, int kind, const void *color, uint32_t mask, bool depth, float dval, bool stencil, uint32_t sval,
                   uint32_t smask) {
+    if (clear_defer(index, color, mask, depth, dval, stencil, sval, smask)) return;
     begin_pass();
     VkCommandBuffer cb = vk_cmd();
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
@@ -1769,10 +2035,13 @@ static void fx_patch_fs(Prog *p) {
                          (unsigned long long)h, (int)n, mode == FX_DOWN ? "13-tap downsample" : mode == FX_SOFT ? "rotated-grid" : "B-spline");
 }
 
+static uint64_t gmem_limit(void);
+static int gmem_chunk_shift(void);
 static void translate_program(void *arg) {
     Prog *p = arg;
     maxwell_gmem_base = HEAP_BASE;
-    maxwell_gmem_size = HEAP_MAX;
+    maxwell_gmem_size = gmem_limit();
+    maxwell_gmem_chunk_shift = gmem_chunk_shift();
     uint64_t t0 = SDL_GetTicksNS();
     p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
     // Experiment (research): LARECOMP_EXP_VS_EARLY=<vertex program address, hex>: that program's vertex shader returns at
@@ -2215,7 +2484,7 @@ static void pipe_exec_report(VkPipeline pipe, uint64_t vs, uint64_t fs) {
         if (ns > 64) ns = 64;
         for (uint32_t s = 0; s < ns; s++) stats[s].sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR;
         if (get_stats(g_vk.dev, &einfo, &ns, stats) != VK_SUCCESS) continue;
-        char line[1024];
+        char line[4096];
         int l = snprintf(line, sizeof line, "[pipestats] vs %llx fs %llx  %s (stages %#x):", (unsigned long long)vs, (unsigned long long)fs,
                          props[i].name, props[i].stages);
         for (uint32_t s = 0; s < ns && l < (int)sizeof line - 80; s++) {
@@ -2779,6 +3048,7 @@ static VkDeviceMemory gmem_mem;
 static uint64_t gmem_size;
 
 static bool gmem_import(uint64_t size) {
+    if (g_vk.heap_export) return false;  // (Android: the heap is GPU memory itself, renderer_share_heap)
     PFN_vkGetMemoryHostPointerPropertiesEXT props =
         (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(g_vk.dev, "vkGetMemoryHostPointerPropertiesEXT");
     VkMemoryHostPointerPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
@@ -2815,11 +3085,267 @@ static bool gmem_import(uint64_t size) {
 
 static uint64_t gmem_tried;  // heap size the import was last attempted for (gmem_info imports / re-imports)
 
+// ---- the game's memory pools in GPU memory (Android). Its drivers can't import process memory (no
+// VK_EXT_external_memory_host), so the memory the GPU reads in place - what the game puts in its NVN memory pools, as on
+// the Switch, where the GPU sees nothing else - becomes GPU memory itself: when the game makes a pool, its pages get an
+// exportable allocation (pieces of at most maxMemoryAllocationSize) holding what they had, mapped over them from its fd
+// (VK_KHR_external_memory_fd); when it finalizes one, its pages go back to plain memory. Not the whole heap: the driver
+// commits a whole allocation at once (+2.2 GB of RAM for the 3.2 GB heap, measured). The game's code sees memory as
+// before. Shaders reach a page through a table of device addresses, one per heap page (maxwell_gmem_chunk_shift 12,
+// gmem_info binds it; pages outside pools: one zero page); in-place reads through the piece's buffer (guest_direct).
+#ifdef __ANDROID__
+#include <errno.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#define PAGE_SHIFT_GM 12
+typedef struct { uint64_t at, n, free_after; VkBuffer buf; VkDeviceMemory mem; } HeapPiece;
+static pthread_mutex_t pieces_lk = PTHREAD_MUTEX_INITIALIZER;
+static HeapPiece *pieces, *dead;  // live pieces by address; finalized ones, freed once the GPU is past them
+static int npieces, cap_pieces, ndead, cap_dead;
+static VkBuffer ptab_buf, zero_buf;
+static uint64_t *ptab;             // per heap page: its device address (the zero page outside pools)
+static VkDeviceAddress zero_page;
+static uint64_t piece_max;         // largest allocation
+static uint64_t pool_bytes;        // in GPU memory now
+
+static uint32_t heap_memory_type(uint32_t bits, bool host_only) {
+    static int forced = -2;  // LARECOMP_VK_HEAP_TYPE=<index>: that memory type for the pools (measurements)
+    if (forced == -2) forced = getenv("LARECOMP_VK_HEAP_TYPE") ? atoi(getenv("LARECOMP_VK_HEAP_TYPE")) : -1;
+    if (!host_only && forced >= 0 && forced < 32 && (bits >> forced & 1)) return (uint32_t)forced;
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+    const VkMemoryPropertyFlags want[] = {  // (cached first; exportable memory on Adreno: uncached only)
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+    for (int w = 0; w < 2; w++)
+        for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+            if ((bits >> i & 1) && (mp.memoryTypes[i].propertyFlags & want[w]) == want[w]) return i;
+    return UINT32_MAX;
+}
+
+// A buffer over its own host-visible allocation, with a device address; exp: exportable (its fd in *fd).
+static bool gm_alloc(uint64_t n, bool exp, VkBuffer *buf, VkDeviceMemory *mem, void **map, int *fd, uint32_t *type_out) {
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                           .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = exp ? &eb : NULL, .size = n,
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                      VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
+    if (vkCreateBuffer(g_vk.dev, &bi, NULL, buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(g_vk.dev, *buf, &mr);
+    uint32_t type = heap_memory_type(mr.memoryTypeBits, !exp);
+    VkMemoryAllocateFlagsInfo fl = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = &fl, .buffer = *buf};
+    VkExportMemoryAllocateInfo ex = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, .pNext = &ded,
+                                     .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = exp ? (void *)&ex : (void *)&ded,
+                               .allocationSize = mr.size, .memoryTypeIndex = type};
+    if (type == UINT32_MAX || vkAllocateMemory(g_vk.dev, &ai, NULL, mem) != VK_SUCCESS) {
+        vkDestroyBuffer(g_vk.dev, *buf, NULL);
+        return false;
+    }
+    vkBindBufferMemory(g_vk.dev, *buf, *mem, 0);
+    *map = NULL, *fd = -1;
+    PFN_vkGetMemoryFdKHR get_fd = exp ? (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(g_vk.dev, "vkGetMemoryFdKHR") : NULL;
+    VkMemoryGetFdInfoKHR fi = {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = *mem,
+                               .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT};
+    if (vkMapMemory(g_vk.dev, *mem, 0, VK_WHOLE_SIZE, 0, map) != VK_SUCCESS || (exp && (!get_fd || get_fd(g_vk.dev, &fi, fd) != VK_SUCCESS))) {
+        if (*map) vkUnmapMemory(g_vk.dev, *mem);
+        vkDestroyBuffer(g_vk.dev, *buf, NULL);
+        vkFreeMemory(g_vk.dev, *mem, NULL);
+        return false;
+    }
+    if (type_out) *type_out = type;
+    return true;
+}
+static VkDeviceAddress gm_address(VkBuffer buf) {
+    VkBufferDeviceAddressInfo da = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = buf};
+    return vkGetBufferDeviceAddress(g_vk.dev, &da);
+}
+
+// The page table and the zero page, when the game sets its heap up (kernel.c SetHeapSize; again after an in-place reboot).
+uint64_t renderer_share_heap(uint64_t lo, uint64_t size) {
+    (void)lo, (void)size;
+    if (!g_vk.dev || !g_vk.heap_export || getenv("LARECOMP_VK_NO_GMEM") || ptab) return 0;
+    VkDeviceMemory mem;
+    void *zmap;
+    int fd;
+    uint64_t tn = (HEAP_MAX >> PAGE_SHIFT_GM) * 8;
+    if (!gm_alloc(tn, false, &ptab_buf, &mem, (void **)&ptab, &fd, NULL)) { LOG("[vk] no page table for the pools: shader global memory reads return zero\n"); return 0; }
+    if (!gm_alloc(1 << PAGE_SHIFT_GM, false, &zero_buf, &mem, &zmap, &fd, NULL)) {
+        LOG("[vk] no zero page for the pools: shader global memory reads return zero\n");
+        ptab = NULL;  // (the table's allocation stays)
+        return 0;
+    }
+    memset(zmap, 0, 1 << PAGE_SHIFT_GM);
+    zero_page = gm_address(zero_buf);
+    for (uint64_t i = 0; i < tn / 8; i++) ptab[i] = zero_page;
+    VkPhysicalDeviceMaintenance3Properties m3 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES};
+    VkPhysicalDeviceProperties2 pp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &m3};
+    vkGetPhysicalDeviceProperties2(g_vk.phys, &pp);
+    piece_max = m3.maxMemoryAllocationSize & ~0xFFFFull;
+    LOG("[vk] memory pools in GPU memory for shader global memory (pieces of up to %llu MB)\n", (unsigned long long)(piece_max >> 20));
+    return 0;
+}
+
+static void reap_dead(bool all) {  // (pieces_lk held)
+    uint64_t done = all ? UINT64_MAX : vk_completed_seq();
+    int k = 0;
+    for (int i = 0; i < ndead; i++) {
+        if (dead[i].free_after <= done) {
+            vkDestroyBuffer(g_vk.dev, dead[i].buf, NULL);
+            vkFreeMemory(g_vk.dev, dead[i].mem, NULL);
+        } else dead[k++] = dead[i];
+    }
+    ndead = k;
+}
+
+// One piece of a pool: [at, at + n) into GPU memory, keeping what it holds.
+static bool piece_make(uint64_t at, uint64_t n) {
+    HeapPiece p = {.at = at, .n = n};
+    void *drv;
+    int fd;
+    uint32_t type;
+    if (!gm_alloc(n, true, &p.buf, &p.mem, &drv, &fd, &type)) return false;
+    static int checked;
+    memcpy(drv, (void *)(uintptr_t)at, n);
+    bool ok = mmap((void *)(uintptr_t)at, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) != MAP_FAILED;
+    if (ok && !checked) {  // (the first time: the fd's mapping is the driver's memory)
+        volatile uint32_t *here = (volatile uint32_t *)(uintptr_t)at, keep = here[0];
+        here[0] = keep ^ 0x5a5a5a5au;
+        ok = ((volatile uint32_t *)drv)[0] == (keep ^ 0x5a5a5a5au);
+        here[0] = keep;
+        if (!ok) mmap((void *)(uintptr_t)at, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0),
+                 memcpy((void *)(uintptr_t)at, drv, n);
+        LOG("[vk] memory pools: %s (memory type %u)\n", ok ? "their GPU memory mapped in place" : "the fd's mapping is not the GPU memory", type);
+        checked = ok ? 1 : -1;
+    }
+    close(fd);  // (the mapping stays)
+    vkUnmapMemory(g_vk.dev, p.mem);
+    if (!ok) {
+        vkDestroyBuffer(g_vk.dev, p.buf, NULL);
+        vkFreeMemory(g_vk.dev, p.mem, NULL);
+        return false;
+    }
+    VkDeviceAddress a = gm_address(p.buf);
+    uint64_t pg = (at - HEAP_BASE) >> PAGE_SHIFT_GM;
+    for (uint64_t k = 0; k < n >> PAGE_SHIFT_GM; k++) ptab[pg + k] = a + (k << PAGE_SHIFT_GM);
+    pthread_mutex_lock(&pieces_lk);
+    if (npieces == cap_pieces) pieces = realloc(pieces, sizeof *pieces * (size_t)(cap_pieces = cap_pieces ? cap_pieces * 2 : 1024));
+    int i = npieces;
+    while (i > 0 && pieces[i - 1].at > at) i--;
+    memmove(&pieces[i + 1], &pieces[i], sizeof *pieces * (size_t)(npieces - i));
+    pieces[i] = p;
+    npieces++;
+    pool_bytes += n;
+    pthread_mutex_unlock(&pieces_lk);
+    return true;
+}
+
+// nvnMemoryPoolInitialize (objects.c): a pool in the heap, page-aligned, goes into GPU memory.
+void backend_pool_created(uint64_t addr, uint64_t size) {
+    if (!ptab || addr < HEAP_BASE || addr + size > HEAP_BASE + HEAP_MAX || !size || ((addr | size) & ((1 << PAGE_SHIFT_GM) - 1))) return;
+    pthread_mutex_lock(&pieces_lk);
+    reap_dead(false);
+    pthread_mutex_unlock(&pieces_lk);
+    for (uint64_t off = 0; off < size;) {
+        uint64_t n = size - off < piece_max ? size - off : piece_max;
+        if (!piece_make(addr + off, n)) {
+            static int nlog;
+            if (nlog++ < 8) LOG("[vk] pool %llx (%llu KB) not in GPU memory: shader reads of it return zero\n", (unsigned long long)addr,
+                                (unsigned long long)(size >> 10));
+        }
+        off += n;
+    }
+}
+
+// nvnMemoryPoolFinalize (objects.c, after rt_drain): its pages back to plain memory, keeping what they hold; the GPU
+// memory is freed once the GPU is past everything submitted so far.
+void backend_pool_destroyed(uint64_t addr, uint64_t size) {
+    if (!ptab) return;
+    pthread_mutex_lock(&pieces_lk);
+    int k = 0;
+    for (int i = 0; i < npieces; i++) {
+        HeapPiece *p = &pieces[i];
+        if (p->at < addr || p->at >= addr + size) { pieces[k++] = *p; continue; }
+        uint64_t pg = (p->at - HEAP_BASE) >> PAGE_SHIFT_GM;
+        for (uint64_t j = 0; j < p->n >> PAGE_SHIFT_GM; j++) ptab[pg + j] = zero_page;
+        void *tmp = malloc(p->n);
+        if (tmp) memcpy(tmp, (void *)(uintptr_t)p->at, p->n);
+        mmap((void *)(uintptr_t)p->at, p->n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+        if (tmp) memcpy((void *)(uintptr_t)p->at, tmp, p->n), free(tmp);
+        pthread_mutex_lock(&seq_lock);
+        p->free_after = submit_seq + 1;  // (work recorded but not submitted yet goes with the next submission)
+        pthread_mutex_unlock(&seq_lock);
+        if (ndead == cap_dead) dead = realloc(dead, sizeof *dead * (size_t)(cap_dead = cap_dead ? cap_dead * 2 : 256));
+        dead[ndead++] = *p;
+        pool_bytes -= p->n;
+    }
+    npieces = k;
+    reap_dead(false);
+    pthread_mutex_unlock(&pieces_lk);
+}
+
+// In-place reboot (vk_exec_reset, GPU idle; guest memory is replaced next): every piece freed, the table cleared.
+static void pools_reset(void) {
+    if (!ptab) return;
+    pthread_mutex_lock(&pieces_lk);
+    for (int i = 0; i < npieces; i++) {
+        pieces[i].free_after = 0;
+        if (ndead == cap_dead) dead = realloc(dead, sizeof *dead * (size_t)(cap_dead = cap_dead ? cap_dead * 2 : 256));
+        dead[ndead++] = pieces[i];
+    }
+    npieces = 0, pool_bytes = 0;
+    reap_dead(true);
+    for (uint64_t i = 0; i < HEAP_MAX >> PAGE_SHIFT_GM; i++) ptab[i] = zero_page;
+    pthread_mutex_unlock(&pieces_lk);
+}
+
+// The piece holding [addr, addr + size) (false: not in a pool's GPU memory).
+static bool heap_chunk_at(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+    bool ok = false;
+    pthread_mutex_lock(&pieces_lk);
+    int lo = 0, hi = npieces;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (pieces[mid].at + pieces[mid].n <= addr) lo = mid + 1; else hi = mid;
+    }
+    if (lo < npieces && pieces[lo].at <= addr && addr + size <= pieces[lo].at + pieces[lo].n) {
+        *buf = pieces[lo].buf, *off = addr - pieces[lo].at;
+        ok = true;
+    }
+    pthread_mutex_unlock(&pieces_lk);
+    return ok;
+}
+// What shaders are translated for: the bytes global memory covers, its pages (log2; 0: one buffer).
+static uint64_t gmem_limit(void) { return HEAP_MAX; }
+static int gmem_chunk_shift(void) { return ptab ? PAGE_SHIFT_GM : 0; }
+#else
+uint64_t renderer_share_heap(uint64_t lo, uint64_t size) { (void)lo, (void)size; return 0; }  // (VK_EXT_external_memory_host)
+void backend_pool_created(uint64_t addr, uint64_t size) { (void)addr, (void)size; }
+void backend_pool_destroyed(uint64_t addr, uint64_t size) { (void)addr, (void)size; }
+static void pools_reset(void) {}
+static bool heap_chunk_at(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+    (void)addr, (void)size, (void)buf, (void)off;
+    return false;
+}
+static uint64_t gmem_limit(void) { return HEAP_MAX; }
+static int gmem_chunk_shift(void) { return 0; }
+#endif
+
 static VkDescriptorBufferInfo gmem_info(void) {
+#ifdef __ANDROID__
+    if (ptab) return (VkDescriptorBufferInfo){ptab_buf, 0, (HEAP_MAX >> PAGE_SHIFT_GM) * 8};  // (the pools' page table)
+#endif
     static int off = -1;
-    if (off < 0) off = getenv("LARECOMP_VK_NO_GMEM") != NULL || !g_vk.host_import;
+    if (off < 0) off = getenv("LARECOMP_VK_NO_GMEM") != NULL || (!g_vk.host_import && !g_vk.heap_export);
     uint64_t want = (kernel_heap_size() + 0xFFFF) & ~0xFFFFull;
     if (want > HEAP_MAX) want = HEAP_MAX;
+    static int64_t cap_mb = -1;  // LARECOMP_VK_GMEM_MB=<n>: only the heap's first n MB (what Android's 1 GB share gives)
+    if (cap_mb < 0) cap_mb = getenv("LARECOMP_VK_GMEM_MB") ? atoll(getenv("LARECOMP_VK_GMEM_MB")) : 0;
+    if (cap_mb > 0 && want > (uint64_t)cap_mb << 20) want = (uint64_t)cap_mb << 20;
     if (!off && want > gmem_size && !gmem_import(want)) {
         LOG("[vk] guest heap import failed (%llu MB): shader global memory reads return zero\n", (unsigned long long)(want >> 20));
         off = 1;
@@ -2909,6 +3435,7 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     static int copy = -1;
     if (copy < 0) copy = getenv("LARECOMP_VK_COPY_VERTICES") != NULL;
     if (copy || addr < HEAP_BASE) return false;
+    if (g_vk.heap_export) return heap_chunk_at(addr, size, buf, off);
     if (addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
     *buf = gmem_buf;
@@ -2942,13 +3469,15 @@ void vk_exec_reset(void) {
     keep_drop_all();
     keep_heap = 0;
     gcopy_gen++;
-    if (gmem_buf) {
+    if (gmem_buf && !g_vk.heap_export) {  // (Android's shared heap stays: renderer_share_heap maps it again)
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
         vkFreeMemory(g_vk.dev, gmem_mem, NULL);
         gmem_buf = VK_NULL_HANDLE;
         gmem_mem = VK_NULL_HANDLE;
     }
-    gmem_size = gmem_tried = 0;
+    if (!g_vk.heap_export) gmem_size = 0;
+    gmem_tried = 0;
+    pools_reset();
     st_defaults();
 }
 
@@ -3055,11 +3584,15 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     }
     for (int i = 0; i < p->nbinds; i++) {
         VkBindingInfo *b = &p->binds[i];
-        if (b->set != set || b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || (b->binding != 18 && b->binding != 19 && b->binding != 20)) continue;
+        if (b->set != set || b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b->binding < 18 || b->binding > 21) continue;
         w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = b->binding,
                                       .descriptorCount = 1, .descriptorType = b->type};
         if (b->binding == 20) {  // (TAA: this frame's jitter)
             bi[n] = ubo_span(vk_transient_copy(taa_jitter(), 16, 256), 16);
+        } else if (b->binding == 21) {  // (wide screens: ShaderKey.widen's scale)
+            extern float widescreen_aspect(void);
+            float wa = widescreen_aspect(), wv[4] = {wa > 1.0f ? (16.0f / 9.0f) / wa : 1.0f, (float)g_wide_ui, 0, 0};
+            bi[n] = ubo_span(vk_transient_copy(wv, 16, 256), 16);
         } else if (b->binding == 18) {
             for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; }
             bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, sizeof rs, 256), sizeof rs);
@@ -3111,7 +3644,8 @@ static CsProg *compute_program(NvnProgram *np) {
     CsProg *cp = calloc(1, sizeof *cp);
     if (n < 256) { tab[n].addr = ss->code_addr; tab[n].content = ss->content_hash; tab[n].cp = cp; g_cs_n = n + 1; }
     maxwell_gmem_base = HEAP_BASE;
-    maxwell_gmem_size = HEAP_MAX;
+    maxwell_gmem_size = gmem_limit();
+    maxwell_gmem_chunk_shift = gmem_chunk_shift();
     ShaderKey k = {0};
     k.glsl = 1;
     cp->si = maxwell_translate((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, STAGE_COMPUTE, &k);
@@ -3426,6 +3960,8 @@ static void ssao_find_projection(void) {
             return;
         }
         float proj[4];
+        const uint8_t *wb = wide_block(blk, bsz);  // (wide screens: the camera as the draws have it)
+        if (wb) blk = wb;
         if (blk && ao.poff + 64 <= bsz && ssao_proj_at((const float *)(blk + ao.poff), proj) &&
             !cam_at_origin((const float *)(blk + ao.poff))) {
             memcpy(ao.proj, proj, sizeof ao.proj);
@@ -3566,6 +4102,12 @@ static void draw_(CmdRec *r, bool indexed) {
     ShaderKey vkey = {0}, fkey = {0};
     vkey.glsl = fkey.glsl = 1;
     vkey.jitter = jitter_on() && st.rt.depth && st.rt.depth == ao.dtex && st.ds[0];  // (TAA, FSR 3)
+    {   // wide screens: draws into the screen-shaped images (scalable: the scene, its depth, its effects' smaller ones)
+        extern float widescreen_aspect(void);
+        TexBackend *c0 = st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->backend : NULL;
+        TexBackend *d0 = st.rt.depth ? st.rt.depth->backend : NULL;
+        vkey.widen = widescreen_aspect() > 1.0f && ((c0 && (c0->scalable || c0->presented)) || (d0 && d0->scalable));
+    }
     vkey.flip_y = fkey.flip_y = nvn_window_origin() == 0;
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
@@ -3622,8 +4164,11 @@ static void draw_(CmdRec *r, bool indexed) {
         }
     }
     resolve_feedback(pr);
-    // (FSR 3: the interface mask; frame generation: the real frames' mask, for their in-between images - ip_ui_keep)
-    if (((g_settings.upscaler == UPSCALE_FSR3 && fsr3_on()) || (g_settings.frame_gen && ip_enabled())) && !ip_replaying) ui_snapshot_check(pr);
+    // (FSR 3, DittoSR: the interface mask; frame generation: the real frames' mask, for their in-between images - ip_ui_keep)
+    extern float widescreen_aspect(void);  // (wide screens: the interface's image, ui_scene_rt, for its centred 16:9 box)
+    if ((fsr3_on() || gsr2_on() || (g_settings.frame_gen && ip_enabled()) || widescreen_aspect() > 1.0f) &&
+        !ip_replaying)
+        ui_snapshot_check(pr);
     snap_reason = "draw-depthwrite";
     if (st.rt.depth && st.ds[0] && st.ds[1]) snapshots_invalidate(st.rt.depth);
     snap_reason = "draw-colorwrite";
@@ -3785,12 +4330,23 @@ static void draw_(CmdRec *r, bool indexed) {
     float zn = st.depth_range[0][0], zf = st.depth_range[0][1];
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     float tint[8] = {0};  // (the per-draw tint the translator can apply to colour target 0: none)
-    // fragment textures are bound before deciding the viewport (tex_sc / tex_wh), rscale depends on the decision:
-    // build the vertex set now and the fragment set after the decision (stage_set fills tex_sc for stage 1).
+    // fragment textures are bound before deciding the viewport (tex_sc / tex_wh), rscale and the wide screens'
+    // interface placement depend on the decision: both sets after it (stage_set fills tex_sc for stage 1).
     if (prof) prof_dyn += SDL_GetTicksNS() - prof_td_;
-    PROF_T0();
-    VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL);
-    PROF_ADD(prof_sets);
+    g_wide_ui = 0;
+    {   // wide screens: camera-attached effects sized for 16:9 stretched, not widened (ShaderKey.widen's 3) - the battle's
+        // intro (the speed lines and the blurred layers in front of the camera: in a wider view their edges showed the
+        // field behind); LARECOMP_WIDE_STRETCH=<fs hash>,... adds others (research). Depth-tested 3D otherwise widened
+        // whatever its projection (4: the Pokedex's model is orthographic).
+        extern bool widescreen_effect_stretch(uint64_t fs_hash);
+        static char list[512] = {1};
+        if (list[0] == 1) snprintf(list, sizeof list, "%s", getenv("LARECOMP_WIDE_STRETCH") ? getenv("LARECOMP_WIDE_STRETCH") : "");
+        char h[20];
+        snprintf(h, sizeof h, "%016llx", (unsigned long long)g_cur_fs_hash);
+        if (vkey.widen && (widescreen_effect_stretch(g_cur_fs_hash) || (list[0] && strstr(list, h)))) g_wide_ui = 3;
+        else if (vkey.widen && dt) g_wide_ui = 4;
+    }
+    bool wide_vp = false;  // (the interface placed by its vertex shader: the viewport the whole image's)
     VkDescriptorImageInfo fii[64];
     uint64_t prof_tx_ = prof ? SDL_GetTicksNS() : 0;
     for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
@@ -3799,7 +4355,11 @@ static void draw_(CmdRec *r, bool indexed) {
         tex_sc[1][i][0] = sc[0]; tex_sc[1][i][1] = sc[1]; tex_wh[1][i][0] = wh[0]; tex_wh[1][i][1] = wh[1];
     }
     if (prof) prof_tex += SDL_GetTicksNS() - prof_tx_;
-    if (fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
+    // (wide screens: also the full-screen images the game draws its interface into before its last pass - two, one
+    // frame each - their draws without a depth test; the 3D ones there, with the scene's depth, stay the scene's)
+    TexBackend *rt0b = st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->backend : NULL;
+    bool ui_rt = widescreen_aspect() > 1.0f && rt0b && rt0b->scalable && st.rt.color[0]->width >= 1280 && !dt;
+    if (fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && (renderer_texture_presented(st.rt.color[0]) || ui_rt)) {
         // Draws into the swapchain image (see renderer.m): composites fill the window, UI goes in a centred 16:9 box.
         bool reads_scene = false;
         for (int i = 0; i < pr->fi->ntex && i < 64; i++)
@@ -3809,7 +4369,11 @@ static void draw_(CmdRec *r, bool indexed) {
         bool fullscreen_quad = r->x[2] <= 6 && st.viewport[0][0] == 0 && st.viewport[0][1] == 0 &&
                                st.viewport[0][2] >= st.rt.color[0]->width && st.viewport[0][3] >= st.rt.color[0]->height;
         bool fullscreen_fill = pr->fi->ntex == 0 && fullscreen_quad;
-        if (fullscreen_quad && !reads_scene && pr->fi->ntex == 1 && (tex_sc[1][0][0] != 1 || tex_sc[1][0][1] != 1)) reads_scene = true;
+        if (fullscreen_quad && !reads_scene && pr->fi->ntex == 1 && (tex_sc[1][0][0] != 1 || tex_sc[1][0][1] != 1)) {
+            // (a scene image: not the interface's own 2x images and text cache, scaled too - runtime/ui2x.c, font_hires.c)
+            NvnTexture *t0 = shader_texture_object(1, &pr->fi->tex[0]);
+            if (t0 && t0->backend && ((TexBackend *)t0->backend)->scalable) reads_scene = true;
+        }
         static uint64_t wide_frame = ~0ull;
         if (reads_scene) wide_frame = renderer_present_count();
         bool fade_fill = false;
@@ -3827,6 +4391,18 @@ static void draw_(CmdRec *r, bool indexed) {
             vp_sx = vp_sy = u;
             vp_ox = (pw - st.rt.color[0]->width * u) * 0.5f;
             vp_oy = (ph - st.rt.color[0]->height * u) * 0.5f;
+            // wide screens, a draw over the whole screen (its viewport): placed by its vertex shader instead
+            // (ShaderKey.widen) - in the box but for what touches the screen's sides; a background (a 16:9 image of
+            // 480 or more, in one piece or several) covers the window. The box stays a smaller scissor's.
+            bool full_vp = st.viewport[0][0] == 0 && st.viewport[0][1] == 0 && st.viewport[0][2] >= st.rt.color[0]->width &&
+                           st.viewport[0][3] >= st.rt.color[0]->height;
+            if (widescreen_aspect() > 1.0f && full_vp) {
+                NvnTexture *t0 = pr->fi->ntex >= 1 ? shader_texture_object(1, &pr->fi->tex[0]) : NULL;
+                bool img = t0 && t0->backend && !((TexBackend *)t0->backend)->scalable && tex_wh[1][0][0] >= 480 &&
+                           fabsf((float)tex_wh[1][0][0] / (float)tex_wh[1][0][1] - 16.0f / 9.0f) < 0.05f;  // (not the scene's)
+                g_wide_ui = img ? 2 : 1;
+                wide_vp = true;
+            }
         }
     }
     {   // (research, LARECOMP_COUNT_FS=<fs hash>: draws with that fragment shader per frame, logged when the count changes)
@@ -3844,13 +4420,14 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     {
         float vx = vp[0] * vp_sx + vp_ox, vw = vp[2] * vp_sx;
-        set_viewport(vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, zn, zf);
+        if (wide_vp) set_viewport(vp[0] * pass_sx, vp[1] * pass_sy, vp[2] * pass_sx, vp[3] * pass_sy, zn, zf);
+        else set_viewport(vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, zn, zf);
         if (g_debug_frame) {
             VkRect2D sr = scissor_rect();
-            LOG("[draw]   vp %.2f %.2f %.2f %.2f (fs hash %016llx) scissor %d %d %u %u | guest sc %d %d %d %d | pass %ux%u s %.4f %.4f\n",
+            LOG("[draw]   vp %.2f %.2f %.2f %.2f (fs hash %016llx) scissor %d %d %u %u | guest sc %d %d %d %d | pass %ux%u s %.4f %.4f wide %d%s\n",
                 vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, (unsigned long long)g_cur_fs_hash, sr.offset.x, sr.offset.y,
                 sr.extent.width, sr.extent.height, st.scissor[0][0], st.scissor[0][1], st.scissor[0][2], st.scissor[0][3], pass_w, pass_h,
-                vp_sx, vp_sy);
+                vp_sx, vp_sy, g_wide_ui, wide_vp ? " (full viewport)" : "");
         }
     }
     apply_scissor();
@@ -3860,7 +4437,9 @@ static void draw_(CmdRec *r, bool indexed) {
     gpuw_stores(pr->fi, st.sbuf[1], 16, "fragment shader", st.program->stages[1].code_addr);
     gpur_loads(pr->vi, st.sbuf[0], 16);
     gpur_loads(pr->fi, st.sbuf[1], 16);
+    VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL);
     VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii);
+    g_wide_ui = 0;  // (this draw's: written; the next scissor - a clear's - is the box's again)
     if (prof) prof_sets += SDL_GetTicksNS() - prof_t1_;
     VkDescriptorSet sets[2] = {vset, fset};
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, 0, NULL);
@@ -4366,14 +4945,15 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
 static VkPipelineLayout present_layout;
 static VkDescriptorSetLayout present_set_layout;
 
+// push constants: flip, crop, colour grade
 static VkPipeline present_pipeline(VkFormat fmt) {
-    static struct { VkFormat f; VkPipeline p; } cache[4];
-    for (int i = 0; i < 4; i++) if (cache[i].p && cache[i].f == fmt) return cache[i].p;
+    static struct { VkFormat f; VkPipeline p; } cache[8];
+    for (int i = 0; i < 8; i++) if (cache[i].p && cache[i].f == fmt) return cache[i].p;
     if (!present_layout) {
         VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
         VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &b};
         VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &present_set_layout));
-        VkPushConstantRange r = {VK_SHADER_STAGE_VERTEX_BIT, 0, 32};
+        VkPushConstantRange r = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48};
         VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
                                          .pSetLayouts = &present_set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &r};
         VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &present_layout));
@@ -4405,7 +4985,7 @@ static VkPipeline present_pipeline(VkFormat fmt) {
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = present_layout};
     VkPipeline p;
     VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
-    for (int i = 0; i < 4; i++) if (!cache[i].p) { cache[i].f = fmt; cache[i].p = p; break; }
+    for (int i = 0; i < 8; i++) if (!cache[i].p) { cache[i].f = fmt; cache[i].p = p; break; }
     return p;
 }
 
@@ -4493,12 +5073,15 @@ static VkPipeline post_pipeline(const char *fs) { return post_pipeline_ex(fs, VK
 // 31: that image sharpened, 32: debanding (the last post pass), 33, 34: contact shadows (mask, blur: contact_run), 35: their
 // debug view, 36: an in-between image with frame N's interface (ip_ui_keep), 37: FSR 3.1's output with the interface
 // composited after it, 38, 39: the GI-size distance (R16, log2) and normals (gi_run). The in-between images at a
-// reduced size (vk_tex_lo_begin) have a set of their own (48 on):
+// reduced size (vk_tex_lo_begin) have a set of their own (64 on). 40-46: the optical flow's (flow_*), 47: DittoSR's output
+// lined, its interface after it, 50: its motion and depth clip (render size, RGBA16F), 51, 52: its history (output
+// size, ping-pong: gsr2_run), 63: the convert pass's output's other half (ping-pong with 50), 128, 129: DittoSR's
+// change (x2_change.frag):
 // sized for them, they were made again at every switch between a real frame and an in-between image, and the real
 // frames' histories (SSAO, GI, TAA) went with them.
 static TexBackend *post_image_fmt(int i, uint32_t w, uint32_t h, VkFormat fmt) {
-    static TexBackend img[96];
-    TexBackend *d = &img[i + (vk_tex_lo_active() ? 48 : 0)];
+    static TexBackend img[256];  // (128 on: more slots, each with its reduced twin 64 further)
+    TexBackend *d = &img[i + (vk_tex_lo_active() ? 64 : 0)];
     if (d->image && (d->width != w || d->height != h || d->format != fmt)) {
         vk_views_forget(d);
         vk_defer_image(d->image, d->mem);
@@ -4983,9 +5566,17 @@ static uint64_t taa_jit_frame = ~0ull;
 // its motion vectors and depth handed to it; TAA steps aside (FSR anti-aliases)
 static bool fsr3_engaged;
 static uint32_t fsr3_rw, fsr3_rh, fsr3_ow;
-static bool fsr3_on(void) { return g_settings.upscaler == UPSCALE_FSR3 && fsr3_engaged; }
-static bool taa_on(void) { return g_settings.antialias == AA_TAA && !fsr3_on(); }
-static bool jitter_on(void) { return taa_on() || fsr3_on(); }
+// (DittoSR (FSR4), with FSR 3.1's inputs: as FSR 3.1 here - its jitter sequence too)
+static bool fsr3_up(void) { return g_settings.upscaler == UPSCALE_FSR3 || UPSCALE_IS_FSR4(g_settings.upscaler); }
+static TexBackend *post_image(int i, uint32_t w, uint32_t h);
+static bool fsr3_on(void) { return fsr3_up() && fsr3_engaged; }
+// DittoSR ran at the last present (gsr2_run): the scene jittered as for FSR 3.1, a Halton sequence of ceil(8 x ratio^2)
+// phases (AMD's count for the ratio, which Qualcomm's GSR 2 sample takes too)
+static bool gsr2_engaged;
+static uint32_t gsr2_rw, gsr2_ow;
+static bool gsr2_on(void) { return UPSCALE_IS_DITTOSR(g_settings.upscaler) && gsr2_engaged; }
+static bool taa_on(void) { return AA_ON(g_settings.antialias) == AA_TAA && !fsr3_on(); }
+static bool jitter_on(void) { return taa_on() || fsr3_on() || gsr2_on(); }
 static float halton(uint32_t i, uint32_t b) {
     float f = 1, r = 0;
     for (; i; i /= b) f /= (float)b, r += f * (float)(i % b);
@@ -5002,6 +5593,11 @@ static const float *taa_jitter(void) {
         float w = ao.cw ? (float)ao.cw : 1280, h = ao.ch ? (float)ao.ch : 720;
         float jx = halton(i, 2) - 0.5f, jy = halton(i, 3) - 0.5f;
         if (fsr3_on()) fsr3_jitter(fsr3_rw, fsr3_ow, seq, &jx, &jy);  // (FSR's own sequence, for its ratio)
+        else if (gsr2_on() && gsr2_rw) {
+            float r = (float)gsr2_ow / (float)gsr2_rw;
+            uint32_t phases = (uint32_t)ceilf(8.0f * r * r), k = (uint32_t)(seq % phases) + 1;
+            jx = halton(k, 2) - 0.5f, jy = halton(k, 3) - 0.5f;
+        }
         taa_jit[0] = jx * 2.0f / w;  // (a pixel is 2 / size in clip units: the content moves by (jx, jy) pixels)
         taa_jit[1] = jy * 2.0f / h;
         taa_jit[2] = jx, taa_jit[3] = jy;
@@ -5063,12 +5659,14 @@ static void ui_snapshot_check(Prog *pr) {
     bool presented = renderer_texture_presented(st.rt.color[0]);
     if (!presented && tb != ui_scene_rt) return;
     if (!pr->fi->ntex) return;  // (an untextured fill: a fade, not the interface)
-    // reading a scaled render target: the scene's composite, not the interface (the interface's own 2x images and the
-    // high-resolution text cache are scaled too, and are the interface: runtime/ui2x.c, font_hires.c)
+    // reading a scalable render target: the scene's composite, not the interface (the interface's own 2x images and the
+    // high-resolution text cache are scaled too, but not scalable: runtime/ui2x.c, font_hires.c). At any scale - at the
+    // game's own size (1) the copy was made before the composite and the mask covered the whole image: every
+    // in-between image of the optical flow was N's
     for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
         NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
         TexBackend *b = t ? t->backend : NULL;
-        if (b && b->scalable && (b->sx != 1 || b->sy != 1)) {
+        if (b && b != tb && b->scalable) {
             if (presented && b->width == tb->width && b->height == tb->height)  // (the last pass: its input, at this size)
                 ui_final_src = ui_scene_rt = b, ui_final_frame = fr;
             return;
@@ -5132,11 +5730,108 @@ static TexBackend *ip_ui_keep(VkCommandBuffer cb, TexBackend *in, TexBackend *ni
 // The view the present samples: the game image, or its anti-aliased / upscaled version. ow x oh: the whole image's
 // size in the window (its crop is drawn into the viewport).
 static double post_last_ow, post_last_oh;  // the output size post_process was last asked for
+static float g_present_grade[4];  // the colour grade post_process leaves to the present's draw ([3] > 0.5: apply it)
 static VkImageView post_process_ex(VkCommandBuffer cb, TexBackend *b, double ow_d, double oh_d, TexBackend **res);
+// DittoSR (UPSCALE_DITTOSR; gsr2_* names the path it grew from, Snapdragon GSR 2): GSR 2's convert pass (shaders.c
+// gsr2_convert.frag: the motion - the nearest of the 3x3's - and how far each pixel's depth stands out from its
+// neighbours', render size), x2_change.frag (how much of the image changed), then our upscale x2_upscale.frag against the
+// previous output moved along the motion (output size, a ping-pong history gamma-encoded as the image, 10 bits a
+// channel: in RGBA16F GSR 2's reads and writes took 2.5 ms of an Adreno 830's frame at 2133 x 1200); x2_final.frag after
+// it (post_process_ex). in: the image (render size, jittered by taa_jitter), mv: the motion vectors.
+static TexBackend *gsr2_mda;  // (gsr2_run's convert pass output this frame: x2_final.frag's motion)
+static TexBackend *gsr2_run(VkCommandBuffer cb, TexBackend *in, TexBackend *mv, uint32_t ow, uint32_t oh) {
+    static int cur;
+    static uint32_t hw, hh;  // (the history's size)
+    static uint64_t last;    // (the real frame it last ran: one missed, the history starts again)
+    uint32_t rw = in->width, rh = in->height;
+    bool reset = !ao.prev_ok || hw != ow || hh != oh || last + 1 != renderer_present_count();
+    hw = ow, hh = oh, last = renderer_present_count();
+    // (the convert pass's output, ping-pong 50 / 63: the rejection by a changed motion reads the previous frame's)
+    static int mcur;
+    TexBackend *mdap = post_image_fmt(mcur ? 63 : 50, rw, rh, VK_FORMAT_R16G16B16A16_SFLOAT);
+    mcur ^= 1;
+    TexBackend *mda = post_image_fmt(mcur ? 63 : 50, rw, rh, VK_FORMAT_R16G16B16A16_SFLOAT);
+    VkFormat hf = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    TexBackend *prev = post_image_fmt(51 + cur, ow, oh, hf);
+    cur ^= 1;
+    TexBackend *out = post_image_fmt(51 + cur, ow, oh, hf);
+    // (112 bytes of constants: x2_upscale.frag's, as the standalone DittoSR's upscale)
+    float pc[28] = {(float)rw, (float)rh, (float)ow, (float)oh, 1.0f / (float)rw, 1.0f / (float)rh, 1.0f / (float)ow, 1.0f / (float)oh,
+                    taa_jit[2], taa_jit[3], (float)ow / (float)rw, 0,
+                    // tan(horizontal fov / 2) for the convert pass's depth clip, then the reset (its output: this frame's
+                    // image alone)
+                    (float)rw / ((float)rh * ao.proj[1]), 0, reset ? 1.0f : 0.0f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    static const VkComponentMapping id = {0};
+    VkImageView dv = vk_image_view(ao.depth, VK_IMAGE_VIEW_TYPE_2D, ao.depth->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT);
+    VkImageView ci[2] = {dv, post_view(mv)};
+    post_pass_view(cb, post_pipeline_ex("gsr2_convert.frag", VK_FORMAT_R16G16B16A16_SFLOAT, 0), ci, 2, post_view(mda), rw, rh, pc,
+                   64, false, false);
+    // (the upscale's knobs into its constants only, after the convert pass - it reads d.x as the field of view: 0 there
+    // marked every pixel's depth as standing out, the history all but unused. Research: LARECOMP_EXP2_ALPHA, _CONF,
+    // _GAMMA - 0 their defaults)
+    static float k[4] = {-1, 0, 0, 0};
+    if (k[0] < 0) {
+        k[3] = getenv("LARECOMP_EXP2_WIDTH") ? (float)atof(getenv("LARECOMP_EXP2_WIDTH")) : 0.8f;  // (the narrow Gaussian 0.8 wide)
+        // (at rest, a pixel stable for 3 frames: x2_upscale.frag's stability level - 0.05 before it, as stable as GSR 2)
+        k[0] = getenv("LARECOMP_EXP2_ALPHA") ? (float)atof(getenv("LARECOMP_EXP2_ALPHA")) : 0.035f;
+        k[1] = getenv("LARECOMP_EXP2_CONF") ? (float)atof(getenv("LARECOMP_EXP2_CONF")) : 0.05f;  // (the narrow estimate alone from 0.05)
+        k[2] = getenv("LARECOMP_EXP2_GAMMA") ? (float)atof(getenv("LARECOMP_EXP2_GAMMA")) : 0;
+    }
+    pc[12] = k[0], pc[13] = k[1], pc[15] = k[2], pc[11] = k[3];  // (c.w: the narrow Gaussian's width x, _WIDTH)
+    // (research: LARECOMP_EXP2_JX / _JY = the jitter's sign per axis, as the image's pixels see it)
+    static float jx = 0, jy = 0;
+    if (!jx) jx = getenv("LARECOMP_EXP2_JX") ? (float)atof(getenv("LARECOMP_EXP2_JX")) : 1, jy = getenv("LARECOMP_EXP2_JY") ? (float)atof(getenv("LARECOMP_EXP2_JY")) : 1;
+    pc[8] *= jx, pc[9] *= jy;
+    // (the share by nearness - b.xy: the new frame's share x 0.05 where no jittered sample landed close, x 3 where one
+    // did; LARECOMP_EXP2_AFAR, _ANEAR)
+    static float af = -1, an = 0;
+    if (af < 0) af = getenv("LARECOMP_EXP2_AFAR") ? (float)atof(getenv("LARECOMP_EXP2_AFAR")) : 0.05f,
+                an = getenv("LARECOMP_EXP2_ANEAR") ? (float)atof(getenv("LARECOMP_EXP2_ANEAR")) : 3;
+    pc[4] = af, pc[5] = an;
+    // (the reaction to changes, the edge-directed Gaussian, thin lines kept: LARECOMP_EXP2_REACT, _EDGE, _LOCK - e)
+    static float ke[3] = {-1, 0, 0};
+    if (ke[0] < 0) {
+        ke[0] = getenv("LARECOMP_EXP2_REACT") ? (float)atof(getenv("LARECOMP_EXP2_REACT")) : 1;  // (the menu closed: 10 frames late -> as DittoSR (FSR4))
+        ke[1] = getenv("LARECOMP_EXP2_EDGE") ? (float)atof(getenv("LARECOMP_EXP2_EDGE")) : 1;
+        ke[2] = getenv("LARECOMP_EXP2_LOCK") ? (float)atof(getenv("LARECOMP_EXP2_LOCK")) : 0;
+    }
+    pc[16] = ke[0], pc[17] = ke[1], pc[18] = ke[2];
+    // (f and g: moving, the new frame's base share, the colour's Gaussian width, b.y; the history clipped by its low
+    // frequencies; the disocclusion (0) or GSR 2's depth clip (1); the clip width moving; how far the box keeps within the
+    // samples' min / max. LARECOMP_EXP2_MSHARE, _MWIDTH, _MNEAR, _SPLIT, _DEPTHMODE, _MGAMMA, _MMINMAX)
+    static float kf[7] = {-1};
+    if (kf[0] < 0) {
+        static const char *const ne[7] = {"LARECOMP_EXP2_MSHARE", "LARECOMP_EXP2_MWIDTH", "LARECOMP_EXP2_MNEAR", "LARECOMP_EXP2_SPLIT",
+                                          "LARECOMP_EXP2_DEPTHMODE", "LARECOMP_EXP2_MGAMMA", "LARECOMP_EXP2_MMINMAX"};
+        static const float dv[7] = {0.15f, 1.6f, 1.5f, 1, 0, 1.5f, 1};
+        for (int i = 0; i < 7; i++) kf[i] = getenv(ne[i]) ? (float)atof(getenv(ne[i])) : dv[i];
+    }
+    for (int i = 0; i < 7; i++) pc[20 + i] = kf[i];
+    pc[27] = g_settings.dittosr_frame_weight;  // (g.w: x the new frame's share)
+    // (the fast settling: how much of the image changed against its history - x2_change.frag, 4 x 4 R16F, then
+    // averaged into 1 x 1)
+    TexBackend *chg = post_image_fmt(128, 1, 1, VK_FORMAT_R16_SFLOAT);
+    if (!reset) {
+        TexBackend *c4 = post_image_fmt(129, 4, 4, VK_FORMAT_R16_SFLOAT);
+        VkPipeline pch = post_pipeline_ex("x2_change.frag", VK_FORMAT_R16_SFLOAT, 0);
+        float pz[8] = {0}, p1[8] = {1};
+        VkImageView gi[3] = {post_view(prev), post_view(mda), raw_view(in)};
+        post_pass_view(cb, pch, gi, 3, post_view(c4), 4, 4, pz, 32, false, false);
+        VkImageView ri[3] = {post_view(c4), post_view(mda), raw_view(in)};
+        post_pass_view(cb, pch, ri, 3, post_view(chg), 1, 1, p1, 32, false, false);
+    }
+    VkImageView ui[5] = {post_view(prev), post_view(mda), raw_view(in), post_view(mdap), post_view(chg)};
+    gp_mark(cb, "ours: DittoSR upscale");
+    post_pass_view(cb, post_pipeline_ex("x2_upscale.frag", hf, 0), ui, 5, post_view(out), ow, oh, pc, 112, false, false);
+    gsr2_mda = mda;
+    return out;
+}
+static TexBackend *hold_copy_into(TexBackend *d, TexBackend *src);
 static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, double oh_d) {
     return post_process_ex(cb, b, ow_d, oh_d, NULL);
 }
 extern uint64_t fps60_period_ns(void);  // (runtime/hle/fps60.c: the game's frame time now)
+static bool flow_on(void);  // (frame generation by the optical flow: below)
 // res (may be NULL): the image behind the view returned (b when nothing was done)
 static VkImageView post_process_ex(VkCommandBuffer cb, TexBackend *b, double ow_d, double oh_d, TexBackend **res) {
     post_last_ow = ow_d, post_last_oh = oh_d;
@@ -5156,36 +5851,63 @@ static VkImageView post_process_ex(VkCommandBuffer cb, TexBackend *b, double ow_
     // FSR 3: an upscale, its DLL, and this frame's scene depth and motion vectors at the image's size
     uint64_t fr = fx_frame();
     // (Native AA: FSR 3.1 at the same size, as anti-aliasing)
-    bool fsr3 = g_settings.upscaler == UPSCALE_FSR3 && (upscale || g_settings.fsr3_preset == FSR3_NATIVE_AA) && fsr3_available() &&
+    bool fsr3 = fsr3_up() && (upscale || g_settings.fsr3_preset == FSR3_NATIVE_AA) && fsr3_available() &&
+                (!UPSCALE_IS_FSR4(g_settings.upscaler) || dittosr_available()) &&
                 ao.depth && ao.taa_frame == fr &&
                 ao.depth->width == b->width && ao.depth->height == b->height && ao.proj_frame == fr;
-    bool smaa = g_settings.antialias == AA_SMAA && !fsr3;
-    bool fsr = (g_settings.upscaler == UPSCALE_FSR1 || (g_settings.upscaler == UPSCALE_FSR3 && !fsr3)) && upscale;  // (an upscale only)
+    // DittoSR: the same, without a DLL (an in-between image of frame generation: resolved against N's output, as FSR 3.1's
+    // are)
+    bool gsr2 = UPSCALE_IS_DITTOSR(g_settings.upscaler) && (upscale || g_settings.fsr3_preset == FSR3_NATIVE_AA) && ao.depth &&
+                ao.taa_frame == fr && ao.depth->width == b->width && ao.depth->height == b->height && ao.proj_frame == fr;
+    bool smaa = AA_ON(g_settings.antialias) == AA_SMAA && !fsr3 && !gsr2;
+    bool fsr = (g_settings.upscaler == UPSCALE_FSR1 || (fsr3_up() && !fsr3) ||
+                (UPSCALE_IS_DITTOSR(g_settings.upscaler) && !gsr2)) && upscale;  // (an upscale only)
     float grade[3] = {g_settings.brightness, g_settings.contrast, g_settings.saturation};  // (F12 menu)
     bool color = fabsf(grade[0] - 1) > 0.005f || fabsf(grade[1] - 1) > 0.005f || fabsf(grade[2] - 1) > 0.005f;
-    bool sharpen = taa_on() && !fsr && !fsr3 && g_settings.taa_sharpness > 0.01f;  // (TAA softens)
+    bool sharpen = taa_on() && !fsr && !fsr3 && !gsr2 && g_settings.taa_sharpness > 0.01f;  // (TAA softens)
     if (!fsr3) fsr3_engaged = false;
+    if (!gsr2 && !ip_side_post) gsr2_engaged = false;
     if (!ip_side_post) {  // (the real frames': the in-between images are rendered from the same constants)
         static float env = -100;
         if (env == -100) env = getenv("LARECOMP_MIP_BIAS") ? (float)atof(getenv("LARECOMP_MIP_BIAS")) : -99;
-        bool temporal = fsr3 || taa_on();
-        float off = env != -99 ? env : fsr3 ? -1.0f : -0.5f;
+        bool temporal = fsr3 || gsr2 || taa_on();
+        float off = env != -99 ? env : fsr3 || gsr2 ? -1.0f : -0.5f;
         float mb = temporal && off != 0 ? log2f((float)b->width / (float)ow) + off : 0;
         mb = roundf(mb * 4) / 4;
-        mb = mb < -2 ? -2 : mb > 0 ? 0 : mb;
+        // (DittoSR: its own floor, LARECOMP_EXP2_MIPMIN - at 3x the ratio asks -2.6)
+        static float x2mip = 1;
+        if (x2mip > 0) x2mip = getenv("LARECOMP_EXP2_MIPMIN") ? (float)atof(getenv("LARECOMP_EXP2_MIPMIN")) : -2.6f;
+        float mlo = UPSCALE_IS_DITTOSR(g_settings.upscaler) ? x2mip : -2.0f;
+        mb = mb < mlo ? mlo : mb > 0 ? 0 : mb;
         if (mb != g_mip_bias) LOG("[post] mip bias %.2f\n", mb);
         g_mip_bias = mb;
     }
-    // Debanding and a dither of one 8-bit step, last (deband.frag): on unless LARECOMP_DEBAND=0 (comparison)
+    // Debanding and a dither of one 8-bit step, last (deband.frag): on unless LARECOMP_DEBAND=0 (comparison). Off on
+    // Android unless LARECOMP_DEBAND=1: ~12% of a phone's GPU frame at 1080p, for banding hardly seen on its screen.
     static int deband = -1;
+#ifdef __ANDROID__
+    if (deband < 0) deband = getenv("LARECOMP_DEBAND") ? atoi(getenv("LARECOMP_DEBAND")) : 0;
+#else
     if (deband < 0) deband = getenv("LARECOMP_DEBAND") ? atoi(getenv("LARECOMP_DEBAND")) : 1;
-    if (!smaa && !fsr && !color && !sharpen && !fsr3 && !deband) { if (res) *res = rb_; return v; }
+#endif
+    // The colour grade in the present's own draw (present.frag) when nothing comes after it here:
+    // one full-size pass (written to memory and read back) less. Every image reaching the window goes through the present.
+    // Not with the optical flow and nothing else here: it starts from N's processed image (flow_prepare), and without
+    // one there were no in-between images at all - Android, no anti-aliasing nor debanding: 30 fps with 4x on. The grade
+    // stays here then, an identity one too.
+    bool flow_src = flow_on() && !smaa && !sharpen && !fsr && !fsr3 && !gsr2 && !deband;
+    if (flow_src) color = true;
+    bool grade_late = color && !sharpen && !fsr && !fsr3 && !gsr2 && !deband && !flow_src;
+    g_present_grade[0] = grade[0], g_present_grade[1] = grade[1], g_present_grade[2] = grade[2];
+    g_present_grade[3] = grade_late ? 1.0f : 0.0f;
+    if (grade_late) color = false;
+    if (!smaa && !fsr && !color && !sharpen && !fsr3 && !gsr2 && !deband) { if (res) *res = rb_; return v; }
     extern void vk_frame_suspend(void);
     extern void vk_frame_resume(void);
     vk_frame_suspend();
     // (frame generation without FSR 3.1: the real frame's interface mask, for its reduced in-between images' resolve -
     // ip_lo_resolve, ip_ui_keep)
-    if (!fsr3 && !ip_side_post && ip_enabled() && g_settings.frame_gen && ui_mask_build(cb, b, fr)) cb = vk_cmd();
+    if (!fsr3 && !gsr2 && !ip_side_post && ip_enabled() && g_settings.frame_gen && ui_mask_build(cb, b, fr)) cb = vk_cmd();
     if (smaa) {  // SMAA 1x: luma edges -> blending weights -> neighbourhood blending
         float w = (float)b->width, h = (float)b->height;
         float m[8] = {1.0f / w, 1.0f / h, w, h};
@@ -5213,13 +5935,18 @@ static VkImageView post_process_ex(VkCommandBuffer cb, TexBackend *b, double ow_
         post_pass(cb, "rcas.frag", ri_, 1, r, pr, false);
         v = post_view(r), rb_ = r;
     }
-    if (fsr3) {  // FSR 3.1: the image (after the colour pass), the scene depth as R32F, the motion vectors
+    if (fsr3 || gsr2) {  // FSR 3.1 / DittoSR: the image (after the colour pass), the scene depth (FSR: as R32F), the motion vectors
         TexBackend *in = vb;
         // an in-between image (frame interpolation): resolved against N's FSR 3.1 output instead - FSR's history goes on
         // with the real frames only (side_resolve.frag, post image 30); it needs neither the depth copy nor the mask
         TexBackend *nh = ip_side_post ? ip_n_post(ow, oh) : NULL;
-        TexBackend *dr = nh ? NULL : post_image_fmt(23, b->width, b->height, VK_FORMAT_R32_SFLOAT);
-        TexBackend *out = post_image_fmt(24, ow, oh, VK_FORMAT_R8G8B8A8_UNORM);
+        // (OptiScaler injected, LARECOMP_FSR3_OPTISCALER=1: the image copied into one of ours that lives on. OptiScaler
+        // keeps the image views of a dispatch until the next one, and through a loading screen or a menu - no dispatch
+        // - the game freed its own image: destroying the view later, the NVIDIA driver jumped into freed memory)
+        static TexBackend fsr_in;
+        if (fsr3 && !nh && fsr3_optiscaler()) in = hold_copy_into(&fsr_in, in);
+        TexBackend *dr = nh || !fsr3 ? NULL : post_image_fmt(23, b->width, b->height, VK_FORMAT_R32_SFLOAT);
+        TexBackend *out = fsr3 ? post_image_fmt(24, ow, oh, VK_FORMAT_R8G8B8A8_UNORM) : NULL;
         TexBackend *mv = post_image_fmt(8, ao.depth->width, ao.depth->height, VK_FORMAT_R16G16B16A16_SFLOAT);
         static const VkComponentMapping id = {0};
         float pz[8] = {0};
@@ -5233,8 +5960,32 @@ static VkImageView post_process_ex(VkCommandBuffer cb, TexBackend *b, double ow_
         VkImage mask = VK_NULL_HANDLE;
         TexBackend *mt = nh ? NULL : ui_mask_build(cb, b, fr);
         if (mt) mask = mt->image, cb = vk_cmd();  // (a dump submits the command buffer)
-        gp_mark(cb, "ours: FSR 3.1%s", ip_side_post ? " side resolve (in-between)" : "");
-        Fsr3Dispatch d = {.color = in->image, .depth = dr ? dr->image : VK_NULL_HANDLE, .mv = mv->image, .mask = mask, .output = out->image,
+        // (OptiScaler: the motion vectors and the mask copied too - post images 8 and 26 are made again at another size
+        // by the frames without FSR 3.1 in between, a menu or another scene's depth. And once a mask was given, one every
+        // frame - cleared where there is none: OptiScaler 10.0.0-pre1 destroys the last dispatch's mask view without
+        // forgetting it, and a dispatch without a mask left it to be destroyed again at the next one - the crash in the
+        // NVIDIA driver (FSR2_Vk.cpp, fsrTransparencyView), right after a loading screen or a menu)
+        static TexBackend fsr_mv, fsr_mask;
+        if (fsr3 && !nh && fsr3_optiscaler()) {
+            mv = hold_copy_into(&fsr_mv, mv);
+            if (mt) mask = hold_copy_into(&fsr_mask, mt)->image;
+            else if (fsr_mask.image && fsr_mask.width == b->width && fsr_mask.height == b->height) {
+                VkCommandBuffer c2 = vk_cmd();
+                vk_barrier(c2, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                VkClearColorValue zero = {{0}};
+                VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdClearColorImage(c2, fsr_mask.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rg);
+                vk_barrier(c2, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+                mask = fsr_mask.image;
+            }
+            cb = vk_cmd();
+        }
+        gp_mark(cb, "ours: %s%s", !fsr3 ? "DittoSR" : g_settings.upscaler == UPSCALE_DITTO_FSR4 ? "DittoSR (FSR4)" : "FSR 3.1",
+                ip_side_post ? " side resolve (in-between)" : "");
+        Fsr3Dispatch d = {.color = in->image, .depth = dr ? dr->image : VK_NULL_HANDLE, .mv = mv->image, .mask = mask,
+                          .output = out ? out->image : VK_NULL_HANDLE,
                           .rw = b->width, .rh = b->height, .ow = ow, .oh = oh, .mvw = mv->width, .mvh = mv->height,
                           .jx = taa_jit[2], .jy = taa_jit[3],
                           // the vectors are this uv - the previous one; FSR takes previous - this, in pixels
@@ -5250,7 +6001,12 @@ static VkImageView post_process_ex(VkCommandBuffer cb, TexBackend *b, double ow_
             v = post_view(so), rb_ = so;
             // ... and sharpened as FSR 3.1 sharpens the real frames (RCAS, the same strength: its stops 2 - 2 x sharpness),
             // or the in-between images were softer than the real ones and the detail pulsed at the frame rate
-            if (g_settings.fsr3_sharpness > 0.01f) {
+            // (DittoSR: its sharpening only where the image holds still, its in-between images as N's output - neither
+            // RCAS nor the line pass. LARECOMP_EXP2_MIDLINE: 0 none (default), 1 the line pass, 2 RCAS then the line pass)
+            static int midline = -1;
+            if (midline < 0) midline = getenv("LARECOMP_EXP2_MIDLINE") ? atoi(getenv("LARECOMP_EXP2_MIDLINE")) : 0;
+            bool ditto = UPSCALE_IS_DITTOSR(g_settings.upscaler), exp_line = midline > 0 && ditto;
+            if (g_settings.fsr3_sharpness > 0.01f && (!ditto || midline == 2)) {
                 TexBackend *r = post_image(31, ow, oh);
                 // (0.6 stops weaker than FSR's: the Catmull-Rom history keeps detail of its own - at FSR's strength the
                 // in-between images were 4 - 10 % sharper than the real frames, at 0.7 weaker within 3 %; research:
@@ -5266,9 +6022,23 @@ static VkImageView post_process_ex(VkCommandBuffer cb, TexBackend *b, double ow_
                 post_pass(cb, "rcas.frag", ri_, 1, r, pr, false);
                 v = post_view(r), rb_ = r;
             }
+            if (exp_line) {  // (DittoSR's line pass, as on its real frames)
+                // (its own strengths: the history is N's, lined already - LARECOMP_EXP2_MIDLINE_P=<d>,<l>,<b>)
+                static float q[3] = {-1, 0, 0};
+                if (q[0] < 0) {
+                    q[0] = 0.3f, q[1] = -0.5f, q[2] = 0.5f;  // (4x re-rendered: the face's detail 99.5 %, its lines within 1.2 of 255)
+                    if (getenv("LARECOMP_EXP2_MIDLINE_P")) sscanf(getenv("LARECOMP_EXP2_MIDLINE_P"), "%f,%f,%f", &q[0], &q[1], &q[2]);
+                }
+                TexBackend *r = post_image(rb_ == so ? 31 : 30, ow, oh);
+                float pl[8] = {q[0], q[1], q[2], 0, (float)ow, (float)oh};
+                VkImageView li[3] = {v};
+                post_pass(cb, "ditto_line.frag", li, 1, r, pl, false);
+                v = post_view(r), rb_ = r;
+            }
             TexBackend *u = ip_ui_keep(cb, rb_, nh, false);  // (its interface: N's, ip_ui_keep)
             v = post_view(u), rb_ = u;
-        } else if (!vk_tex_lo_active() && fsr3_dispatch(cb, &d)) {  // (a reduced image never: below, FSR 1)
+        } else if (fsr3 && !vk_tex_lo_active() &&
+                   (UPSCALE_IS_FSR4(g_settings.upscaler) ? dittosr_dispatch(cb, &d) : fsr3_dispatch(cb, &d))) {  // (a reduced image never: below, FSR 1)
             // (its compute writes: the next post pass's barrier, or the end's, waits for them)
             v = post_view(out), rb_ = out;
             fsr3_engaged = true, fsr3_rw = b->width, fsr3_rh = b->height, fsr3_ow = ow;
@@ -5288,11 +6058,31 @@ static VkImageView post_process_ex(VkCommandBuffer cb, TexBackend *b, double ow_
                 post_pass_view(cb, post_pipeline("ui_composite.frag"), ci, 3, post_view(c), ow, oh, pc, 32, false, false);
                 v = post_view(c), rb_ = c;
             }
+        } else if (gsr2 && !vk_tex_lo_active() && !ip_side_post) {  // (an in-between image without N's output: FSR 1)
+            TexBackend *g = gsr2_run(cb, in, mv, ow, oh);
+            v = post_view(g), rb_ = g;
+            gsr2_engaged = true, gsr2_rw = b->width, gsr2_ow = ow;
+            // Then in one pass: the sharpening and the interface after the upscale, as FSR 3.1's (above): still where
+            // the mask says interface (x2_final.frag). The sharpening as the standalone DittoSR's: contrast-adaptive (each
+            // channel against its 4 neighbours, by as much as they leave room before black or white), only where the
+            // image holds still - none from 2 output pixels a frame, less with a low stability level - the slider x 0.2
+            // (1: CAS's strongest)
+            static int uic = -1;
+            if (uic < 0) uic = getenv("LARECOMP_FSR3_UI_COMPOSITE") ? atoi(getenv("LARECOMP_FSR3_UI_COMPOSITE")) : 1;
+            bool ui = uic && mt;
+            gp_mark(cb, "ours: DittoSR sharpening, interface");
+            TexBackend *c = post_image(47, ow, oh);
+            float pf[8] = {0.2f * g_settings.fsr3_sharpness, 0, 0, ui ? 1.0f : 0.0f, (float)ow, (float)oh, 1.0f / (float)ow, 1.0f / (float)oh};
+            VkImageView fi[4] = {v, raw_view(in), ui ? post_view(mt) : raw_view(in), post_view(gsr2_mda)};
+            post_pass_view(cb, post_pipeline("x2_final.frag"), fi, 4, post_view(c), ow, oh, pf, 32, false, false);
+            v = post_view(c), rb_ = c;
         } else {
             fsr3_engaged = false;
+            if (!ip_side_post) gsr2_engaged = false;
             fsr = true;  // (FSR 1 below, this time)
         }
     }
+    if (fsr3 || gsr2) gp_mark(cb, "ours: upscaler done");  // (LOCAL experiment: the upscalers' own GPU time, to here)
     if (fsr) {
         float iw = (float)b->width, ih = (float)b->height;
         TexBackend *e = post_image(3, ow, oh), *r = post_image(4, ow, oh);
@@ -5318,9 +6108,11 @@ static VkImageView post_process_ex(VkCommandBuffer cb, TexBackend *b, double ow_
     {
         static uint32_t piw, pih, pow_, poh;
         static int psm = -1, pfs = -1;
-        int f = fsr3 && fsr3_engaged ? 3 : fsr;
+        // (5: DittoSR (FSR4) - a switch between it and FSR 3.1 at the same sizes is a line too)
+        int f = fsr3 && fsr3_engaged ? (UPSCALE_IS_FSR4(g_settings.upscaler) ? 5 : 3) : gsr2 && gsr2_engaged ? 4 : fsr;
         if (!ip_side_post && (b->width != piw || b->height != pih || ow != pow_ || oh != poh || smaa != psm || f != pfs))
-            LOG("[post] %ux%u%s%s -> %ux%u\n", b->width, b->height, smaa ? " smaa" : "", f == 3 ? " fsr3.1" : f ? " fsr1" : "", ow, oh);
+            LOG("[post] %ux%u%s%s -> %ux%u\n", b->width, b->height, smaa ? " smaa" : "",
+                f == 5 ? " dittosr_fsr4" : f == 4 ? " dittosr" : f == 3 ? " fsr3.1" : f ? " fsr1" : "", ow, oh);
         if (!ip_side_post) piw = b->width, pih = b->height, pow_ = ow, poh = oh, psm = smaa, pfs = f;  // (the real frames')
     }
     return v;
@@ -5328,12 +6120,14 @@ static VkImageView post_process_ex(VkCommandBuffer cb, TexBackend *b, double ow_
 
 // Inside the window image's rendering (device.c vk_frame_begin): the game image into (vx, vy, vw, vh).
 static VkImageView ip_post_view(TexBackend *b, double ow, double oh);
+static float ip_present_sharp;  // (the image drawn now: its IpKeep's sharp - the optical flow's sharpening, flow_image)
 void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh, const float pv[8]) {
     if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return;
     double ow = pv[6] > 0 ? vw / pv[6] : vw, oh = pv[7] > 0 ? vh / pv[7] : vh;
+    ip_present_sharp = 0;
     VkImageView src = ip_post_view(b, ow, oh);  // (an image of a present kept until now: processed when it was made)
-    if (!src) src = post_process(cb, b, ow, oh);
-    gp_mark(cb, "ours: present to the window, menus");
+    if (!src) src = post_process(cb, b, ow, oh), ip_present_sharp = 0;
+    gp_mark(cb, "ours: present to the window, menus%s", g_present_grade[3] > 0.5f ? ", grade" : "");
     VkPipeline p = present_pipeline(g_vk.sc_format);
     VkDescriptorSet ds = vk_alloc_set(present_set_layout);
     VkDescriptorImageInfo ii = {vk_default_sampler(true), src, VK_IMAGE_LAYOUT_GENERAL};
@@ -5344,7 +6138,11 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, present_layout, 0, 1, &ds, 0, NULL);
     VkViewport vp = {vx, vy, vw, vh, 0, 1};
     vkCmdSetViewport(cb, 0, 1, &vp);
-    vkCmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 32, pv);
+    float pc[12];
+    memcpy(pc, pv, 32);
+    pc[1] = ip_present_sharp;  // (a.y: the optical flow's sharpening, flow_image)
+    memcpy(pc + 8, g_present_grade, 16);
+    vkCmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48, pc);
     vkCmdDraw(cb, 3, 1, 0, 0);
     VkViewport full = {0, 0, (float)g_vk.sc_extent.width, (float)g_vk.sc_extent.height, 0, 1};
     vkCmdSetViewport(cb, 0, 1, &full);
@@ -5390,8 +6188,8 @@ void renderer_save_texture_tex(TexBackend *b, const char *path) {
     VkRect2D sc = {{0, 0}, {w, h}};
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdSetScissor(cb, 0, 1, &sc);
-    float pv[8] = {renderer_origin_lower_left() && !strstr(path, "window") ? 1.0f : 0.0f, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};
-    vkCmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 32, pv);
+    float pv[12] = {renderer_origin_lower_left() && !strstr(path, "window") ? 1.0f : 0.0f, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};
+    vkCmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48, pv);
     vkCmdDraw(cb, 3, 1, 0, 0);
     vkCmdEndRendering(cb);
     vk_full_barrier(cb);
@@ -6695,7 +7493,8 @@ static void ip_note_list(uint64_t handle) {
 // not copied: its processed image is drawn from where post_process_ex left it (direct), before the next replay writes
 // there in the command buffer's order. At 4K a copy was ~66 MB of traffic and two full barriers an image.
 #define IP_KEEP_N 8
-typedef struct { TexBackend raw, post; TexBackend *direct; bool post_ok, raw_ok; double ow, oh; } IpKeep;
+// (sharp: the optical flow's sharpening left to the present's draw - flow_image - its strength; 0 none)
+typedef struct { TexBackend raw, post; TexBackend *direct; bool post_ok, raw_ok; double ow, oh; float sharp; } IpKeep;
 static IpKeep ip_keep_sets[2][IP_KEEP_N + 1], *ip_keep = ip_keep_sets[0];
 static TexBackend *hold_copy_into(TexBackend *d, TexBackend *src);
 static VkImageView ip_post_view(TexBackend *b, double ow, double oh) {
@@ -6704,6 +7503,7 @@ static VkImageView ip_post_view(TexBackend *b, double ow, double oh) {
         if (b != &k->raw) continue;
         if (!k->post_ok) return VK_NULL_HANDLE;
         k->post_ok = false;
+        ip_present_sharp = k->sharp;
         TexBackend *d = k->direct;
         k->direct = NULL;
         if (fabs(ow - k->ow) > 0.5 || fabs(oh - k->oh) > 0.5) return VK_NULL_HANDLE;  // (the window changed size)
@@ -6716,9 +7516,10 @@ static TexBackend *ip_keep_image(TexBackend *b, int slot, bool now) {
     IpKeep *k = &ip_keep[slot];
     k->post_ok = k->raw_ok = false;
     k->direct = NULL;
+    k->sharp = 0;
     TexBackend *res = NULL, *in = b;
     // (a reduced in-between image without FSR 3.1: back to N's size against N's image first, then processed as N was)
-    if (slot != IP_KEEP_N && vk_tex_lo_active() && !fsr3_on()) in = ip_lo_resolve(b);
+    if (slot != IP_KEEP_N && vk_tex_lo_active() && !fsr3_on() && !gsr2_on()) in = ip_lo_resolve(b);
     if (post_last_ow > 0 && post_last_oh > 0) {
         ip_side_post = slot != IP_KEEP_N;  // (an in-between image: FSR 3.1's history is the real frames' alone)
         post_process_ex(vk_cmd(), in, post_last_ow, post_last_oh, &res);
@@ -6729,7 +7530,7 @@ static TexBackend *ip_keep_image(TexBackend *b, int slot, bool now) {
         else hold_copy_into(&k->post, res);
         k->post_ok = true, k->ow = post_last_ow, k->oh = post_last_oh;
         // (N's own image, whole, when the reduced in-between images are resolved against it: ip_lo_resolve)
-        if (slot == IP_KEEP_N && ip_lo_factor() < 0.99f && !fsr3_on()) hold_copy_into(&k->raw, b), k->raw_ok = true;
+        if (slot == IP_KEEP_N && ip_lo_factor() < 0.99f && !fsr3_on() && !gsr2_on()) hold_copy_into(&k->raw, b), k->raw_ok = true;
         else if (!k->raw.image) hold_copy_into(&k->raw, b);
         k->raw.sx = b->sx, k->raw.sy = b->sy, k->raw.scalable = b->scalable;
         return &k->raw;
@@ -6925,10 +7726,18 @@ static TexBackend *flow_image(TexBackend *b, int slot, bool now) {
     VkImageView wi[6] = {post_view(c0), post_view(c1), post_view(F), post_view(D), Fp ? post_view(Fp) : dummy,
                          mask ? post_view(ip_ui_mask) : dummy};
     post_pass_view(cb, p, wi, 6, post_view(out), w, h, pw, sizeof pw, false, false);
-    if (sharp > 0) {
+    // The sharpening in the present's own draw when it shows the image pixel for pixel (the output's size: present.frag,
+    // a.y) - one full-size pass written and read back less (at 2670 x 1200 on the phone, ~0.7 ms of the GPU's ~12 a
+    // frame at its top clock). Else a pass of its own. LARECOMP_FLOW_SHARP_PASS=1: always its own pass (comparison).
+    static int sharp_pass = -1;
+    if (sharp_pass < 0) sharp_pass = getenv("LARECOMP_FLOW_SHARP_PASS") ? atoi(getenv("LARECOMP_FLOW_SHARP_PASS")) : 0;
+    k->sharp = 0;
+    if (sharp > 0 && !sharp_pass && w == (uint32_t)lround(kn->ow) && h == (uint32_t)lround(kn->oh)) k->sharp = sharp;
+    else if (sharp > 0) {
         TexBackend *o2 = post_image(46, w, h);
         float pz[8] = {sharp};
         VkImageView si[1] = {post_view(out)};
+        gp_mark(cb, "ours: flow sharpen");
         post_pass_view(cb, ps, si, 1, post_view(o2), w, h, pz, 32, false, false);
         out = o2;
     }
@@ -7240,7 +8049,7 @@ bool vk_interp_begin(TexBackend *b, TexBackend **hold, uint64_t period) {
         // Reduced in-between images: only with frame N's full-size image to resolve them against (FSR 3.1's output, or
         // N's own image)
         ip_lo = ip_lo_factor() < 0.99f &&
-                (fsr3_on() ? ip_n_post(post_last_ow, post_last_oh) != NULL : ip_keep[IP_KEEP_N].raw_ok && post_last_ow > 0);
+                (fsr3_on() || gsr2_on() ? ip_n_post(post_last_ow, post_last_oh) != NULL : ip_keep[IP_KEEP_N].raw_ok && post_last_ow > 0);
     }
     return ok;
 }

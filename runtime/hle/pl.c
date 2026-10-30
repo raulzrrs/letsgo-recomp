@@ -4,7 +4,7 @@
 //     and nintendo_ext_003.bfttf (NintendoExt button glyphs); plain .ttf versions of those names also work
 //  3. a Japanese gothic like UD Shin Go (much closer to the game's look than Arial): Hiragino Sans W4 on macOS,
 //     Yu Gothic Regular / Medium on Windows
-//  4. Arial
+//  4. Arial (Linux: DejaVu Sans, Android: Roboto)
 // .bfttf is the console's obfuscated TTF: 8-byte header (magic, size) then every u32 XORed with a fixed key.
 // .ttc collections get face 0 copied out as a standalone font (the game's font engine wants one sfnt).
 #include <stdlib.h>
@@ -121,7 +121,9 @@ static void load_fonts(void) {
                          // Linux: DejaVu Sans (Debian / Ubuntu, Arch, Fedora). Not Noto Sans CJK: CFF outlines,
                          // which the game's font engine crashes on (it wants TrueType)
                          "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf",
-                         "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf"};
+                         "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+                         // Android: Roboto (TrueType outlines, on every device)
+                         "/system/fonts/Roboto-Regular.ttf"};
     for (size_t i = 0; i < sizeof std / sizeof *std && !fonts[0].addr; i++)
         if (std[i]) load_one(std[i], &fonts[0]);
     if (!fonts[0].addr) FATAL("no usable system font substitute\n");

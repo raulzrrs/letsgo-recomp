@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Android app (tools/build_apk.sh): SDL's Java activity running the runtime (libmain.so) and the game code
+     (liblasgame.so), in landscape either way round. A controller is the input for now (no touch controls).
+     allowNativeHeapPointerTagging off: host memory given to the game (runtime/hle/heaps.c) must be plain addresses, not
+     malloc's tagged pointers (0xb4 in the top byte), which the game's code takes apart. -->
+
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.letsgorecomp"
+    android:versionCode="1"
+    android:versionName="0.6.0-android">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="35" />
+
+    <uses-feature android:glEsVersion="0x00020000" />
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x403000" android:required="true" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <application
+        android:label="Let's Go Recomp"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:hardwareAccelerated="true"
+        android:extractNativeLibs="true"
+        android:isGame="true"
+        android:appCategory="game"
+        android:debuggable="true"
+        android:allowNativeHeapPointerTagging="false"
+        android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+
+        <!-- Back on a controller is the game's B: SDL hands it to the game instead of closing the app -->
+        <meta-data android:name="SDL_ENV.SDL_ANDROID_TRAP_BACK_BUTTON" android:value="1" />
+
+        <activity
+            android:name="dev.letsgorecomp.LetsGoActivity"
+            android:label="Let's Go Recomp"
+            android:screenOrientation="sensorLandscape"
+            android:alwaysRetainTaskState="true"
+            android:launchMode="singleInstance"
+            android:configChanges="layoutDirection|locale|grammaticalGender|fontScale|fontWeightAdjustment|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:preferMinimalPostProcessing="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- USB controllers (SDL's HIDAPI drivers) -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

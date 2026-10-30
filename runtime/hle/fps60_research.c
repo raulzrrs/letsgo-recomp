@@ -32,14 +32,14 @@ static int elapsed_hook(Cpu *c, uint64_t addr) {
     uint64_t saved[32], pc_arg = c->x[1];
     memcpy(saved, c->x, sizeof saved);
     uint64_t obj = pc_arg ? *(uint64_t *)(uintptr_t)pc_arg : 0;
-    if (obj >= 0x7000000000ull && n < 400) {
-        uint64_t vt = *(uint64_t *)(uintptr_t)obj, fn = vt >= 0x7000000000ull ? *(uint64_t *)(uintptr_t)vt : 0;
-        if (fn >= 0x7000000000ull) {
+    if (obj >= GUEST_LO && n < 400) {
+        uint64_t vt = *(uint64_t *)(uintptr_t)obj, fn = vt >= GUEST_LO ? *(uint64_t *)(uintptr_t)vt : 0;
+        if (fn >= GUEST_LO) {
             c->x[0] = obj;
             c->x[1] = (uint64_t)which;
             guest_call(c, fn);
             uint64_t r = c->x[0];
-            if (r >= 0x7000000000ull)
+            if (r >= GUEST_LO)
                 LOG("[elapsed] f_%llx present %llu: delta %lld ns (timer %d: object %llx, getter f_%llx, step %llx)\n", (unsigned long long)addr,
                     (unsigned long long)renderer_game_frame(), (long long)*(const int64_t *)(uintptr_t)(r + 8), which,
                     (unsigned long long)obj, (unsigned long long)fn, (unsigned long long)r);
@@ -82,7 +82,7 @@ static int step_scale_hook(Cpu *c, uint64_t addr) {
     int64_t was = step ? *step : 0;
     static int log = -1, n;  // LARECOMP_STEP_SCALE_LOG=<first present>: the object's +0x494..+0x49c, 40 calls from then
     if (log == -1) log = getenv("LARECOMP_STEP_SCALE_LOG") ? atoi(getenv("LARECOMP_STEP_SCALE_LOG")) : -2;
-    if (log >= 0 && (long)renderer_game_frame() >= log && n < 40 && c->x[0] >= 0x7000000000ull) {
+    if (log >= 0 && (long)renderer_game_frame() >= log && n < 40 && c->x[0] >= GUEST_LO) {
         const uint8_t *o = (const uint8_t *)(uintptr_t)c->x[0];
         n++;
         LOG("[stepscale] present %llu f_%llx obj %llx: +494 %u +498 %u +49c %g +493 %u step %lld\n",
@@ -100,7 +100,7 @@ static int step_scale_hook(Cpu *c, uint64_t addr) {
         static struct { uint64_t obj; float prev[0x400]; int hits[0x400]; int n; } fm[32];
         long f = (long)renderer_game_frame();
         uint64_t o = c->x[0];
-        if (from >= 0 && f >= from && f < from + 6 && o >= 0x7000000000ull) {
+        if (from >= 0 && f >= from && f < from + 6 && o >= GUEST_LO) {
             int i = 0;
             while (i < 32 && fm[i].obj && fm[i].obj != o) i++;
             if (i < 32) {
@@ -166,7 +166,7 @@ static int farg_scale_hook(Cpu *c, uint64_t addr) {
     memcpy(&s0, &c->v[0], 4);
     static int log = -1, n;  // LARECOMP_FARG_LOG=<first present>: x0's floats +0x120..+0x138 (an animation player's), 300 calls
     if (log == -1) log = getenv("LARECOMP_FARG_LOG") ? atoi(getenv("LARECOMP_FARG_LOG")) : -2;
-    if (log >= 0 && (long)renderer_game_frame() >= log && n < 300 && c->x[0] >= 0x7000000000ull) {
+    if (log >= 0 && (long)renderer_game_frame() >= log && n < 300 && c->x[0] >= GUEST_LO) {
         const uint8_t *o = (const uint8_t *)(uintptr_t)c->x[0];
         n++;
         LOG("[farg] present %llu obj %llx dt %g: mode %u fps %u speed %g time %g start %g end %g\n", (unsigned long long)renderer_game_frame(),
@@ -206,7 +206,7 @@ static int watch_hook(Cpu *c, uint64_t addr) {
     if (after != before && n < 200) {
         n++;
         LOG("[fnwatch] present %llu f_%llx (x0 %llx s0 %g, x0 +0x78 %g): %g -> %g (d %g)\n", (unsigned long long)renderer_game_frame(),
-            (unsigned long long)addr, (unsigned long long)x0, s0, x0 >= 0x7000000000ull ? *(const float *)(uintptr_t)(x0 + 0x78) : 0.0f,
+            (unsigned long long)addr, (unsigned long long)x0, s0, x0 >= GUEST_LO ? *(const float *)(uintptr_t)(x0 + 0x78) : 0.0f,
             before, after, after - before);
     }
     return 1;
@@ -228,7 +228,7 @@ static int time_probe_hook(Cpu *c, uint64_t addr) {
     static int lines;
     uint64_t x1 = c->x[1];
     long f = (long)renderer_game_frame();
-    int64_t el = x1 >= 0x7000000000ull && x1 < 0x7800000000ull ? *(const int64_t *)(uintptr_t)(x1 + 8) : -1;
+    int64_t el = x1 >= GUEST_LO && x1 < GUEST_HI ? *(const int64_t *)(uintptr_t)(x1 + 8) : -1;
     rt_call_original(c, addr);
     if (f >= g_tp_from && f <= g_tp_to && lines < 600) {
         double d0;
@@ -335,7 +335,7 @@ static int probe_hook(Cpu *c, uint64_t addr) {
     if (!g_probe_from) g_probe_from = renderer_game_frame() + 1, g_probe_to = g_probe_from + (getenv("LARECOMP_PROBE_FRAMES") ? atoi(getenv("LARECOMP_PROBE_FRAMES")) : 120);
     for (int pass = 0; pass < 2 && g_nprobe < PROBE_MAX; pass++) {
         uint64_t p = pass ? ret : obj;
-        if (p < 0x7000000000ull || p > 0x7800000000ull) continue;
+        if (p < GUEST_LO || p >= GUEST_HI) continue;
         g_probe[g_nprobe].base = p, g_probe[g_nprobe].what = pass ? "returned object" : "x0 object";
         LOG("[probe] f_%llx %s %llx\n", (unsigned long long)addr, g_probe[g_nprobe].what, (unsigned long long)p);
         g_nprobe++;

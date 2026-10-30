@@ -17,7 +17,7 @@
 // Glyph maps (nn::fontll, iType's FS_GLYPHMAP): +0xc left bearing, +0xe top bearing, +0x1c width (= bytes per row),
 // +0x1e rows, +0x28 the 8-bit pixels.
 //
-// Always on: K from the window's height at the first glyph (one step per 720 lines, up to 4; 720p and below: off).
+// Always on: K from the window's height at the first glyph (one step per 720 lines, up to 4; 720p and below, and Android: off).
 // LARECOMP_FONT_SCALE=<1..4> forces K (1: off, for comparisons); LARECOMP_FONT_LOG=1 logs the glyphs drawn (the
 // first few hundred).
 #include <math.h>

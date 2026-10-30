@@ -36,6 +36,7 @@ typedef struct {
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import;
+    bool heap_export;  // the guest heap's start in exported GPU memory mapped there (Android: exec.c renderer_share_heap)
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;

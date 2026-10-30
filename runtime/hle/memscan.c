@@ -29,8 +29,8 @@ static void dump(uint64_t p, size_t len) {
 
 // calls fn(base, size) for each committed, readable, non-guard region of the guest range
 static void each_region(void (*fn)(const uint8_t *, size_t, void *), void *arg) {
-    uint64_t a = 0x7000000000ull;
-    while (a < 0x7800000000ull) {
+    uint64_t a = GUEST_LO;
+    while (a < GUEST_HI) {
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi)) break;
         uint64_t base = (uint64_t)(uintptr_t)mbi.BaseAddress, size = mbi.RegionSize;

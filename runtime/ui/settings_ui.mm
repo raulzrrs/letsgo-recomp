@@ -12,6 +12,7 @@
 extern "C" {
 #include "../paths.h"
 #include "../settings.h"
+bool dittosr_present(void);  // runtime/nvn/vulkan/fsr3.cpp (a local test upscaler's data is there)
 }
 
 // ------------------------------------------------------------------ language
@@ -41,7 +42,8 @@ UiFonts ui_load_fonts(void) {
     UiFonts f = {};
     // (Segoe UI Semibold first: dark text on light pills, as the game's)
     const char *paths[] = {"C:/Windows/Fonts/seguisb.ttf", "C:/Windows/Fonts/segoeui.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                           "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf"};
+                           "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+                           "/system/fonts/Roboto-Regular.ttf"};  // (Android; without it ImGui's small built-in font)
     for (const char *p : paths) {
         if (FILE *fp = fopen(p, "rb")) fclose(fp);  // (a missing file is an assertion in ImGui, not a NULL return)
         else continue;
@@ -487,7 +489,7 @@ void ui_tabs_begin(int *current, int count) {
 
 // ------------------------------------------------------------------ the graphics page
 static const char *const *graphics_labels(int *n) {
-    static const char *l[8];
+    static const char *l[9];
     l[0] = UI_T("Frame rate limit", "Limite de quadros", "Лимит кадров");
     l[1] = UI_T("Ambient occlusion (SSAO)", "Oclusão de ambiente (SSAO)", "Затенение (SSAO)");
     l[2] = UI_T("Indirect light (GI)", "Luz indireta (GI)", "Непрямой свет (GI)");
@@ -496,7 +498,8 @@ static const char *const *graphics_labels(int *n) {
     l[5] = UI_T("FSR 3.1 mode", "Modo do FSR 3.1", "Режим FSR 3.1");
     l[6] = UI_T("Frame generation", "Geração de quadros", "Генерация кадров");
     l[7] = UI_T("Sharpening (AMD RCAS)", "Nitidez (AMD RCAS)", "Резкость (AMD RCAS)");
-    *n = 8;
+    l[8] = UI_T("Upscaler", "Ampliação", "Масштабирование");
+    *n = 9;
     return l;
 }
 
@@ -557,38 +560,73 @@ void ui_page_graphics(float x, bool known) {
                 "As bordas das sombras: como o jogo as desenha, suavizadas ou ainda mais suaves.",
                 "Края теней: как рисует игра, сглаженные или ещё мягче."));
     ui_group_gap();
-    // anti-aliasing: SMAA on the final image (the interface too), TAA on the scene (jittered, motion vectors:
-    // runtime/nvn/vulkan/exec.c taa_run) or FSR 3.1 (temporal, the interface masked: exec.c, fsr3.cpp), the last one
-    // upscaling too, with its mode below. With the others a lower internal resolution is scaled bilinearly
-    // (settings_apply_levels).
+    // The upscaler: how the scene drawn at a lower resolution reaches the window (settings.h UPSCALE_*): bilinear;
+    // FSR 3.1 (temporal, the interface masked: exec.c, fsr3.cpp); DittoSR (temporal, our own: exec.c gsr2_run); DittoSR
+    // (FSR4) (a local test upscaler, offered only where its library and data are - runtime/nvn/vulkan/fsr3.cpp
+    // dittosr_present). The temporal ones take a mode below.
     {
-        const char *aa[] = {UI_T("Off", "Desligado", "Выкл."), "SMAA", "TAA", "FSR 3.1"};
-        ui_row(l[4], x);
-        if (ui_combo("##aa", &g_settings.antialias, aa, 4)) settings_apply_levels();
-        ui_tip(UI_T("Smooths jagged edges. SMAA: light, on the final image. TAA and FSR 3.1: steadier, over several frames; FSR 3.1 also draws the scene at a lower resolution and upscales it.",
-                    "Suaviza os serrilhados. SMAA: leve, na imagem final. TAA e FSR 3.1: mais estáveis, ao longo de vários quadros; o FSR 3.1 também desenha a cena numa resolução menor e a amplia.",
-                    "Сглаживает зубчатые края. SMAA: лёгкое, на итоговом кадре. TAA и FSR 3.1: стабильнее, по нескольким кадрам; FSR 3.1 ещё и рисует сцену в меньшем разрешении и увеличивает её."));
+        static int ditto = -1;
+        if (ditto < 0) ditto = dittosr_present();
+        const char *names[8];
+        int ids[8], n = 0, cur = 0;
+        names[n] = UI_T("Bilinear", "Bilinear", "Билинейное"), ids[n++] = UPSCALE_BILINEAR;
+        names[n] = "FSR 3.1", ids[n++] = UPSCALE_FSR3;
+        names[n] = "DittoSR", ids[n++] = UPSCALE_DITTOSR;
+        if (ditto) names[n] = "DittoSR (FSR4)", ids[n++] = UPSCALE_DITTO_FSR4;
+        for (int i = 0; i < n; i++) if (ids[i] == g_settings.upscaler_pick) cur = i;
+        ui_row(l[8], x);
+        if (ui_combo("##upscaler", &cur, names, n)) g_settings.upscaler_pick = ids[cur], settings_apply_levels();
+        ui_tip(UI_T("How the scene, drawn below the screen's resolution, is brought up to it. Bilinear: plain. FSR 3.1 "
+                    "and DittoSR (lighter): temporal, over several frames - they also smooth the edges, and draw the scene "
+                    "smaller by their mode.",
+                    "Como a cena, desenhada abaixo da resolução da tela, é ampliada até ela. Bilinear: simples. FSR 3.1 "
+                    "e DittoSR (mais leve): temporais, ao longo de vários quadros - também suavizam as bordas e desenham "
+                    "a cena menor conforme o modo.",
+                    "Как сцена, нарисованная ниже разрешения экрана, увеличивается до него. Билинейное: простое. FSR 3.1 "
+                    "и DittoSR (легче): временные, по нескольким кадрам - они же сглаживают края и рисуют сцену меньше "
+                    "по своему режиму."));
     }
-    // FSR 3.1's presets: the render resolution is the window's divided by the ratio (runtime/nvn/output_scale.c)
-    if (g_settings.antialias == AA_FSR3) {
+    // a temporal upscaler's mode: the render resolution is the window's divided by the ratio (runtime/nvn/output_scale.c),
+    // and its sharpening - RCAS, AMD's robust contrast-adaptive sharpening, inside FSR 3.1 / DittoSR (FSR4); DittoSR's
+    // line pass (x2_final.frag); the frame generation's in-between images take it too (exec.c post_process_ex)
+    if (UPSCALE_TEMPORAL(g_settings.upscaler)) {
+        const char *name = UPSCALE_IS_DITTOSR(g_settings.upscaler) || UPSCALE_IS_FSR4(g_settings.upscaler) ? "DittoSR" : "FSR 3.1";
         const char *pr[] = {UI_T("Native AA (1.0x)", "AA nativo (1,0x)", "Нативное AA (1,0x)"),
                             UI_T("Quality (1.5x)", "Qualidade (1,5x)", "Качество (1,5x)"),
                             UI_T("Balanced (1.7x)", "Equilibrado (1,7x)", "Баланс (1,7x)"),
                             UI_T("Performance (2.0x)", "Desempenho (2,0x)", "Производительность (2,0x)"),
                             UI_T("Ultra Performance (3.0x)", "Ultra desempenho (3,0x)", "Макс. производительность (3,0x)")};
-        ui_row(l[5], x);
+        char mode[64];
+        snprintf(mode, sizeof mode, UI_T("%s mode", "Modo do %s", "Режим %s"), name);
+        ui_row(mode, x);
         ui_combo("##fsr3p", &g_settings.fsr3_preset, pr, 5);
-        ui_tip(UI_T("How much lower the scene is drawn before FSR 3.1 upscales it: the window's size divided by the ratio. Higher ratios run faster and look softer.",
-                    "Quanto menor a cena é desenhada antes de o FSR 3.1 ampliá-la: o tamanho da janela dividido pela razão. Razões maiores rodam mais rápido e ficam mais suaves.",
-                    "Во сколько раз меньше рисуется сцена перед увеличением FSR 3.1: размер окна, делённый на коэффициент. Больший коэффициент быстрее, но мягче."));
-        // its sharpening: RCAS, AMD's robust contrast-adaptive sharpening (CAS) inside FSR 3.1 (exec.c post_process; the
-        // frame generation's in-between images take it too)
+        ui_tip(UI_T("How much lower the scene is drawn before the upscaler brings it up: the window's size divided by the ratio. Higher ratios run faster and look softer.",
+                    "Quanto menor a cena é desenhada antes de o ampliador a levar ao tamanho da tela: o tamanho da janela dividido pela razão. Razões maiores rodam mais rápido e ficam mais suaves.",
+                    "Во сколько раз меньше рисуется сцена перед увеличением: размер окна, делённый на коэффициент. Больший коэффициент быстрее, но мягче."));
         float pct = g_settings.fsr3_sharpness * 100;
         ui_row(l[7], x);
         if (ui_slider("##fsr3s", &pct, 0, 100, "%.0f%%", 5)) g_settings.fsr3_sharpness = pct / 100;
-        ui_tip(UI_T("FSR 3.1's own sharpening (RCAS, AMD's contrast-adaptive sharpening). 0% turns it off.",
-                    "A nitidez do próprio FSR 3.1 (RCAS, o realce adaptativo de contraste da AMD). 0% desliga.",
-                    "Собственная резкость FSR 3.1 (RCAS, адаптивное повышение резкости AMD). 0% — выкл."));
+        ui_tip(UI_T("The upscaler's sharpening (RCAS, AMD's contrast-adaptive sharpening). 0% turns it off.",
+                    "A nitidez do ampliador (RCAS, o realce adaptativo de contraste da AMD). 0% desliga.",
+                    "Резкость апскейлера (RCAS, адаптивное повышение резкости AMD). 0% — выкл."));
+    }
+    // anti-aliasing: SMAA on the final image (the interface too) or TAA on the scene (jittered, motion vectors:
+    // runtime/nvn/vulkan/exec.c taa_run). A temporal upscaler anti-aliases itself: the choice is kept but set aside
+    // (settings.h AA_ON), the row disabled.
+    {
+        const char *aa[] = {UI_T("Off", "Desligado", "Выкл."), "SMAA", "TAA"};
+        bool own = UPSCALE_TEMPORAL(g_settings.upscaler);
+        ui_row(l[4], x);
+        ImGui::BeginDisabled(own);
+        if (ui_combo("##aa", &g_settings.antialias, aa, 3)) settings_apply_levels();
+        ImGui::EndDisabled();
+        if (own)
+            ui_tip(UI_T("The upscaler chosen smooths the edges itself.", "O ampliador escolhido já suaviza as bordas.",
+                        "Выбранный апскейлер сам сглаживает края."));
+        else
+            ui_tip(UI_T("Smooths jagged edges. SMAA: light, on the final image. TAA: steadier, over several frames.",
+                        "Suaviza os serrilhados. SMAA: leve, na imagem final. TAA: mais estável, ao longo de vários quadros.",
+                        "Сглаживает зубчатые края. SMAA: лёгкое, на итоговом кадре. TAA: стабильнее, по нескольким кадрам."));
     }
     // Frame generation (exec.c frame interpolation): 2, 3 or 4 images per world frame, the in-between ones drawn by
     // running the frame's draws again with their positions between the last frame's and this one's; Auto: as many as the
@@ -634,7 +672,7 @@ void ui_page_image_sound(void) {
         if (ui_slider("##v", &pct, rows[i].lo * 100, rows[i].hi * 100, "%.0f%%", 5)) *rows[i].v = pct / 100;
         ImGui::PopID();
     }
-    ImGui::BeginDisabled(g_settings.antialias != AA_TAA);  // (FSR 3.1's: the graphics page, under its mode)
+    ImGui::BeginDisabled(AA_ON(g_settings.antialias) != AA_TAA);  // (the temporal upscalers': the graphics page, under their mode)
     {
         float pct = g_settings.taa_sharpness * 100;
         ui_row(l_shp, x);
@@ -650,8 +688,9 @@ void ui_page_image_sound(void) {
 }
 
 // ------------------------------------------------------------------ advanced
-// The motion vectors' detail, the frame generation's method, the effects' parameters by hand and the debug views (shown at the present instead of the
-// game image: exec.c post_process).
+// The motion vectors' detail, the frame generation's method, the performance overlay (ui/menu.mm menu_render),
+// the effects' parameters by hand and the debug views (shown at the present instead of the game image:
+// exec.c post_process).
 // The parameters (runtime/settings.c settings_apply_levels): the sliders show the quality levels' values; moving any of
 // them turns "Custom parameters" on with the values as they are, so the levels then only turn the SSAO and the GI on
 // and off (and the contact shadows have their own switch). Applied live, saved with fx_custom.
@@ -688,9 +727,10 @@ void ui_page_advanced(void) {
                        UI_T("Occlusion alone", "Só a oclusão", "Только затенение"),
                        UI_T("Indirect light alone", "Só a luz indireta", "Только непрямой свет"),
                        UI_T("Motion vectors", "Vetores de movimento", "Векторы движения"),
+                       l_rad, l_int, l_smp, l_tmp, l_cs, l_len, l_str, l_stp, l_thk, l_ray, l_res, l_cus,
                        UI_T("Frame generation method", "Método da geração de quadros", "Метод генерации кадров"),
-                       l_rad, l_int, l_smp, l_tmp, l_cs, l_len, l_str, l_stp, l_thk, l_ray, l_res, l_cus};
-    float x = ui_label_x(l, 17);
+                       UI_T("Performance overlay", "Indicador de desempenho", "Индикатор производительности")};
+    float x = ui_label_x(l, 18);
     ui_toggle("##mv_objects", l[0], x, &g_settings.mv_objects);
     ui_tip(UI_T("The motion of each object, not only the camera's, for TAA, FSR 3.1 and the frame generation.",
                 "O movimento de cada objeto, não só o da câmera, para o TAA, o FSR 3.1 e a geração de quadros.",
@@ -700,7 +740,7 @@ void ui_page_advanced(void) {
     // GPU, less exact where things uncover). Only with the frame generation on (graphics page).
     {
         const char *fm[] = {UI_T("Re-render", "Redesenhar", "Перерисовка"), UI_T("Optical flow", "Fluxo óptico", "Оптический поток")};
-        ui_row(l[4], x);
+        ui_row(l[16], x);
         ImGui::BeginDisabled(!g_settings.frame_gen);
         ui_combo("##fgm", &g_settings.fg_method, fm, 2);
         ImGui::EndDisabled();
@@ -718,6 +758,10 @@ void ui_page_advanced(void) {
                       "Перерисовка (по умолчанию): сцена рисуется заново для каждого дополнительного кадра, всё на полпути между "
                       "двумя кадрами. Точнее всего, но тяжелее всего для GPU."));
     }
+    ui_toggle("##show_fps", l[17], x, &g_settings.show_fps);
+    ui_tip(UI_T("In the top right corner: frames per second, how busy the GPU is, and the CPU use of the game (all cores).",
+                "No canto superior direito: quadros por segundo, quanto a GPU está ocupada e o uso de CPU do jogo (todos os núcleos).",
+                "В правом верхнем углу: кадры в секунду, загрузка GPU и загрузка CPU игрой (все ядра)."));
 
     // ---- the effects' parameters
     ui_heading(UI_T("Effect tuning", "Ajuste dos efeitos", "Настройка эффектов"));
@@ -811,6 +855,7 @@ void ui_page_advanced(void) {
     if (ui_button(UI_T("Reset", "Restaurar", "Сбросить"))) {
         g_settings.ssao_debug = g_settings.gi_debug = g_settings.mv_debug = false;
         g_settings.mv_objects = true;
+        g_settings.show_fps = false;
         g_settings.fg_method = FG_RERENDER;
         g_settings.fx_custom = false;
         settings_apply_levels();

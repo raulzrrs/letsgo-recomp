@@ -137,6 +137,8 @@ void backend_execute(uint64_t handle);            // run a recorded command list
 void backend_present(NvnTexture *tex);            // show a texture in the window
 void backend_texture_destroyed(NvnTexture *tex);
 void backend_pool_written(uint64_t addr, uint64_t size);
+void backend_pool_created(uint64_t addr, uint64_t size);    // (Android: the pool's pages into GPU memory, exec.c)
+void backend_pool_destroyed(uint64_t addr, uint64_t size);  // (after rt_drain: its pages back to plain memory)
 // render thread (vulkan/renderthread.c): with LARECOMP_RENDER_THREAD off these run the backend call on the spot
 bool rt_active(void);
 bool rt_on_render_thread(void);

@@ -30,6 +30,12 @@ extern "C" {
 void input_reset(void);
 uint64_t rt_addr(uint64_t eevee);  // runtime/fnhook.c (0: a build without the tables the frame rate modes need)
 bool input_finger_cursor(float *x, float *y, bool *down);  // runtime/hle/input.c
+uint64_t renderer_gpu_busy_ns(void);  // runtime/nvn/vulkan/exec.c (the performance overlay)
+uint64_t renderer_window_images(void);  // runtime/nvn/vulkan/device.c (... the images that reached the window)
+extern double g_present_rect[4];     // the game image in the window (runtime/hle/input.c)
+extern double g_image_rect[4];       // ... all of it (ultrawide: the interface's 16:9 box is g_present_rect)
+uint64_t plat_now_ns(void);
+uint64_t plat_process_cpu_ns(void);
 }
 
 // ------------------------------------------------------------------ language
@@ -265,7 +271,12 @@ void menu_apply_window_requests(void *win) {
     SDL_Window *w = (SDL_Window *)win;
     g_pixel_density = SDL_GetWindowPixelDensity(w);
     static bool text_input;
-    bool want_text = capturing();
+    // (typed text while the menu is up: a keyboard's, for its fields. Not where text input brings up a screen keyboard
+    // - Android: + and - opened the menu and the phone's keyboard with it; ImGui's backend asks for one while a field
+    // is being typed in)
+    static int screen_kbd = -1;
+    if (screen_kbd < 0) screen_kbd = SDL_HasScreenKeyboardSupport();
+    bool want_text = capturing() && !screen_kbd;
     if (want_text != text_input) {
         if (want_text) SDL_StartTextInput(w);
         else SDL_StopTextInput(w);
@@ -597,17 +608,53 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
 
-    if (g_settings.show_fps) {
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 16 * scale, 16 * scale), 0, ImVec2(1, 0));
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0.5f));  // (dark: over the game, not the menus' look)
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10 * scale);
-        ImGui::Begin("##fps", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-                                        ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
-        ImGui::Text("%.0f fps", io.Framerate);
-        ImGui::End();
-        ImGui::PopStyleVar();
-        ImGui::PopStyleColor(2);
+    if (g_settings.show_fps) {  // the performance overlay (F12 settings, advanced): frame rate | GPU use | CPU use
+        // GPU: the share of the time the submissions ran (their timestamps, exec.c); CPU: this process's CPU time over
+        // all the cores (as a task manager shows it); the frame rate: the images that reached the window, frame generation's
+        // too (ImGui's own rate counts this overlay's frames: the optical flow draws a present's images at once - 68 shown
+        // for 120). Over half a second.
+        static uint64_t t0, gpu0, cpu0, img0;
+        static int gpu_pct = -1, cpu_pct = -1;
+        static double fps = -1;
+        uint64_t t = plat_now_ns();
+        if (!t0 || t - t0 >= 500000000) {
+            uint64_t gpu = renderer_gpu_busy_ns(), cpu = plat_process_cpu_ns(), img = renderer_window_images();
+            int cores = SDL_GetNumLogicalCPUCores();
+            if (t0 && t > t0) {
+                fps = 1e9 * (double)(img - img0) / (double)(t - t0);
+                gpu_pct = (int)lround(fmin(100.0, 100.0 * (double)(gpu - gpu0) / (double)(t - t0)));
+                cpu_pct = (int)lround(fmin(100.0, 100.0 * (double)(cpu - cpu0) / ((double)(t - t0) * (cores > 0 ? cores : 1))));
+            }
+            t0 = t, gpu0 = gpu, cpu0 = cpu, img0 = img;
+        }
+        // A box of a fixed size (dark: over the game, not the menus' look), each value centred in a cell as wide as its
+        // widest text, so nothing moves as the numbers change. Under the menus (the background draw list).
+        char txt[3][16];
+        snprintf(txt[0], sizeof txt[0], "%.0f FPS", fps >= 0 ? fps : io.Framerate);
+        if (gpu_pct >= 0) snprintf(txt[1], sizeof txt[1], "GPU %d%%", gpu_pct);
+        else snprintf(txt[1], sizeof txt[1], "GPU -");
+        if (cpu_pct >= 0) snprintf(txt[2], sizeof txt[2], "CPU %d%%", cpu_pct);
+        else snprintf(txt[2], sizeof txt[2], "CPU -");
+        static const char *const widest[3] = {"000 FPS", "GPU 100%", "CPU 100%"};
+        ImFont *font = g_font;
+        float fs = floorf(34 * 1.15f * scale), gap = floorf(0.8f * fs), pad_x = floorf(0.6f * fs), pad_y = floorf(0.3f * fs);
+        float cw[3], pipe = font->CalcTextSizeA(fs, FLT_MAX, 0, "|").x, w = 2 * pad_x + 2 * (pipe + 2 * gap), h = fs + 2 * pad_y;
+        for (int i = 0; i < 3; i++) w += cw[i] = ceilf(font->CalcTextSizeA(fs, FLT_MAX, 0, widest[i]).x);
+        // (in the game image's corner: a screen wider than 16:9 has black bars at its sides - or, ultrawide, the image
+        // reaching the window's)
+        float x = floorf((float)(g_image_rect[0] + g_image_rect[2]) - 16 * scale - w), y = floorf((float)g_image_rect[1] + 16 * scale);
+        ImDrawList *dl = ImGui::GetBackgroundDrawList();
+        dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(0, 0, 0, 64), 10 * scale);
+        x += pad_x;
+        for (int i = 0; i < 3; i++) {
+            float tw = font->CalcTextSizeA(fs, FLT_MAX, 0, txt[i]).x;
+            dl->AddText(font, fs, ImVec2(floorf(x + (cw[i] - tw) / 2), y + pad_y), IM_COL32(255, 255, 255, 255), txt[i]);
+            x += cw[i];
+            if (i < 2) {
+                dl->AddText(font, fs, ImVec2(floorf(x + gap), y + pad_y), IM_COL32(255, 255, 255, 255), "|");
+                x += pipe + 2 * gap;
+            }
+        }
     }
     if (finger) {  // the controller's finger on the touch screen (right stick moves it, ZR touches)
         ImDrawList *dl = ImGui::GetForegroundDrawList();

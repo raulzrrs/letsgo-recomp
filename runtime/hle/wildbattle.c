@@ -307,7 +307,7 @@ static int trigger_hook(Cpu *c, uint64_t addr) {
     if (getenv("LARECOMP_WILDBATTLE_PROBE")) probe_identity(c);
     uint64_t lr = c->x[30];
     g_mgr = R64(R64(c->x[1], 0), 0x68);
-    g_alloc = R64(R64(R64(GOT_ALLOCATOR, 0), 0), 0x68);
+    g_alloc = R64(R64(R64(GA(GOT_ALLOCATOR), 0), 0), 0x68);
     LOG("[wild] f%llu encounter intercepted (pokemon obj %llx, manager %llx, allocator %llx): building the static battle process\n",
         (unsigned long long)renderer_game_frame(), (unsigned long long)c->x[0], (unsigned long long)g_mgr, (unsigned long long)g_alloc);
     start_battle(c);
@@ -372,7 +372,7 @@ static void hidden_end(Cpu *c, const char *why) {
     g_present_fast = 0, g_audio_muted = 0;
     uint64_t save[32], lr = c->x[30], sp = c->sp;
     memcpy(save, c->x, sizeof save);
-    c->x[0] = R64(R64(GOT_FADE, 0), 0);
+    c->x[0] = R64(R64(GA(GOT_FADE), 0), 0);
     c->x[1] = 0;
     c->x[2] = (uint64_t)g_hidden_fade;
     c->x[3] = (uint64_t)g_hidden_fade_frames;
@@ -415,7 +415,7 @@ static int field_hook(Cpu *c, uint64_t addr) {
         g_fadein_done = true;
         uint64_t save[32], lr = c->x[30], sp = c->sp;
         memcpy(save, c->x, sizeof save);
-        c->x[0] = R64(R64(GOT_FADE, 0), 0);
+        c->x[0] = R64(R64(GA(GOT_FADE), 0), 0);
         c->x[1] = 0;
         c->x[2] = (uint64_t)g_fade_type;
         c->x[3] = (uint64_t)g_fadein_frames;
@@ -1208,7 +1208,7 @@ static int cmdframe_hook(Cpu *c, uint64_t addr) {
     uint64_t out = c->x[8], lr = c->x[30];
     rt_call_original(c, addr);
     c->x[30] = lr;
-    uint64_t obj = R64(out, 0), vt = R64(0x7001608ed8ull, 0) + 0x10;  // (the class' vtable, from the constructor f_7000aab290)
+    uint64_t obj = R64(out, 0), vt = R64(GA(0x7001608ed8ull), 0) + 0x10;  // (the class' vtable, from the constructor f_7000aab290)
     LOG("[wild] f%llu command frame %llx vtable %llx:", (unsigned long long)renderer_game_frame(), (unsigned long long)obj, (unsigned long long)vt);
     for (int i = 0; vt && i < 64; i++) LOG(" %llx", (unsigned long long)R64(vt, 8 * i));
     LOG("\n");

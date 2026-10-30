@@ -29,13 +29,36 @@ endif
 GENSIMD  := --simd $(if $(filter aarch64,$(ARCH)),asm,c)
 endif
 
+# TARGET=android: the Android build (arm64-v8a, docs/ANDROID.md), cross-compiled with the NDK (ANDROID_NDK): the runtime as
+# libmain.so for SDL's Java activity and the game code as liblasgame.so, both packed into the APK by tools/build_apk.sh.
+# The guest window moves below the native heap Android's app processes inherit from zygote (GUEST_LO). Needs
+# make deps-android first.
+ifeq ($(TARGET),android)
+PLATFORM    := linux
+ARCH        := aarch64
+ANDROID_NDK ?= $(HOME)/Android/ndk/29
+ANDROID_API ?= 29
+NDK_BIN     := $(ANDROID_NDK)/toolchains/llvm/prebuilt/windows-x86_64/bin
+$(if $(wildcard $(NDK_BIN)/clang*),,$(error no Android NDK at $(ANDROID_NDK): set ANDROID_NDK))
+CROSS       := --target=aarch64-linux-android$(ANDROID_API) -fPIC
+GEN         := generated-android
+B           := build/android
+GUEST_LO    ?= 0x1000000000
+DEPS        ?= $(CURDIR)/build/deps-android
+GENSIMD     := --simd asm
+endif
+
 # B: build dir. DEPS: a prefix with SDL3 / FFmpeg to use instead of the system's (MSYS2's).
 B         ?= build
+# GUEST_LO: where the guest's address window starts (runtime/rt.h; the game code is generated for it). Android moves it
+# below the native heap its app processes inherit from zygote.
+GUEST_LO  ?= 0x7000000000
+GBASE      = $(shell printf '0x%x' $$(( $(GUEST_LO) + $(1) )))
 DEPS      ?=
 # EXE_NAME: the exe's name (the release's: LetsGoRecomp); the game code library imports from the exe by it
 EXE_NAME  ?= lasrecomp
-CC       := clang $(CROSS)
-CXX      := clang++ $(CROSS)
+CC       := $(if $(NDK_BIN),$(NDK_BIN)/clang,clang) $(CROSS)
+CXX      := $(if $(NDK_BIN),$(NDK_BIN)/clang++,clang++) $(CROSS)
 IMGUI    := third_party/imgui
 GENFLAGS := -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime
 
@@ -67,10 +90,25 @@ LDFLAGS  := -fuse-ld=lld -rdynamic $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
 IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o
+$(B)/rt/nvn/vulkan/fsr3.o: CXXFLAGS += -fdeclspec  # (FidelityFX's ffx_api.h marks its entry points __declspec(dllexport))
 UIFLAGS  := -x c++  # the .mm UI sources are plain C++
 GAMELIB  := $(B)/lasgame.so
 GAMELIB_LDFLAGS := -shared -fuse-ld=lld  # (the runtime functions it calls: the app's own, -rdynamic)
 GAMELIB_SHARED := -shared
+ifeq ($(TARGET),android)  # (both libraries in the APK's lib/arm64-v8a: lib*.so; the shared C++ runtime, as SDL3's)
+EXE      := $(B)/libmain.so
+OSFLAGS  += -DANDROID
+LDFLAGS  := -shared -fuse-ld=lld -Wl,-soname,libmain.so -Wl,-Bsymbolic -L$(DEPS)/lib -lSDL3 -lavformat -lavcodec \
+            -lswscale -lswresample -lavutil -lshaderc_combined -nostdlib++ -lc++_shared -lvulkan -landroid -llog -ldl -lm
+# FSR 3.1: the FidelityFX SDK built from its sources (make ffx-android: tools/build_ffx_android.sh), linked in when made -
+# without it FSR 3.1 falls back to FSR 1 as before
+FFX_LIB  := $(wildcard $(DEPS)/lib/libffx_fsr3.a)
+LDFLAGS  += $(if $(FFX_LIB),-lffx_fsr3)
+$(B)/rt/nvn/vulkan/fsr3.o: CXXFLAGS += $(if $(FFX_LIB),-DLARECOMP_FFX_STATIC)
+# (-Bsymbolic: FFmpeg's AArch64 assembly reaches its tables directly, which a shared library allows only for its own symbols)
+GAMELIB  := $(B)/liblasgame.so
+GAMELIB_LDFLAGS := -shared -fuse-ld=lld -Wl,-soname,liblasgame.so -L$(B) -lmain  # (the runtime's functions: libmain.so's)
+endif
 else
 EXE      := $(B)/$(EXE_NAME).exe
 DEPINC   := $(if $(DEPS),-I$(DEPS)/include)
@@ -110,12 +148,12 @@ GAMELIB_SRCS := tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools
                 tools/simd_c.py tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
                 runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h
 GAMELIB_CFLAGS := $(strip $(filter-out -Iruntime $(GENARCH),$(GENFLAGS)))
-GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GAMELIB_CFLAGS)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
+GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GAMELIB_CFLAGS)$(filter-out 0x7000000000,$(GUEST_LO))') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
 GAMELIB_LEVEL := $(or $(patsubst -march=x86-64-%,%,$(filter -march=x86-64-v%,$(GENARCH))),base)
 
 RT_OBJ   := $(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC))
-RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -Iruntime -Iruntime/nvn $(DEPINC) $(OSFLAGS)
-CXXFLAGS := -O2 -g -std=c++17 -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime/nvn -Ithird_party/fidelityfx/include $(DEPINC)
+RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -Iruntime -Iruntime/nvn $(DEPINC) $(OSFLAGS)             $(if $(filter-out 0x7000000000,$(GUEST_LO)),-DGUEST_LO=$(GUEST_LO)ull)
+CXXFLAGS := -O2 -g -std=c++17 -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime/nvn -Ithird_party/fidelityfx/include $(DEPINC)             $(if $(filter-out 0x7000000000,$(GUEST_LO)),-DGUEST_LO=$(GUEST_LO)ull)
 
 all: $(EXE) $(if $(GEN_SRC),$(GAMELIB))
 
@@ -159,8 +197,10 @@ $(EXE): $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ) $(IMGUI_OBJ)
 	mv -f $(dir $@)link/$(notdir $@) $@
 
 # its id file (<library>.id) says what it was built from without loading it (runtime/gamelib.c)
+# (the ~1000 objects in a response file: their command line passes Windows' 32 KB limit with a longer build folder)
 $(GAMELIB): $(GEN_OBJ) | $(EXE)
-	$(CC) $(GAMELIB_LDFLAGS) -o $@.tmp $^
+	$(file >$@.rsp,$^)
+	$(CC) $(GAMELIB_LDFLAGS) -o $@.tmp @$@.rsp
 	mv -f $@.tmp $@
 	echo $(GAMELIB_ID)-$(GAMELIB_LEVEL) > $@.id
 
@@ -180,10 +220,10 @@ $(B)/imgui/imgui_impl_%.o: $(IMGUI)/backends/imgui_impl_%.cpp
 PY := $(firstword $(wildcard .venv/Scripts/python.exe) $(wildcard .venv/bin/python) $(wildcard tools/venv/bin/python) $(wildcard tools/venv/Scripts/python.exe))
 
 gen:
-	cd tools && $(abspath $(PY)) gen.py sdk ../extracted/exefs/sdk 0x7004000000 ../$(GEN)/sdk --hle ../runtime/hle/hle_symbols.txt $(GENSIMD) $(GENTRACE)
-	cd tools && $(abspath $(PY)) gen.py main ../extracted/exefs/main 0x7000000000 ../$(GEN)/main $(GENSIMD) $(GENTRACE)
-	cd tools && $(abspath $(PY)) gen.py subsdk0 ../extracted/exefs/subsdk0 0x7006000000 ../$(GEN)/subsdk0 $(GENSIMD) $(GENTRACE)
-	cd tools && $(abspath $(PY)) gen.py subsdk1 ../extracted/exefs/subsdk1 0x7008000000 ../$(GEN)/subsdk1 $(GENSIMD) $(GENTRACE)
+	cd tools && $(abspath $(PY)) gen.py sdk ../extracted/exefs/sdk $(call GBASE,0x4000000) ../$(GEN)/sdk --hle ../runtime/hle/hle_symbols.txt $(GENSIMD) $(GENTRACE)
+	cd tools && $(abspath $(PY)) gen.py main ../extracted/exefs/main $(call GBASE,0) ../$(GEN)/main $(GENSIMD) $(GENTRACE)
+	cd tools && $(abspath $(PY)) gen.py subsdk0 ../extracted/exefs/subsdk0 $(call GBASE,0x6000000) ../$(GEN)/subsdk0 $(GENSIMD) $(GENTRACE)
+	cd tools && $(abspath $(PY)) gen.py subsdk1 ../extracted/exefs/subsdk1 $(call GBASE,0x8000000) ../$(GEN)/subsdk1 $(GENSIMD) $(GENTRACE)
 
 gen-objs: $(GEN_OBJ)
 
@@ -206,6 +246,10 @@ DIST     := build/dist/LetsGoRecomp
 WIN_B    := build/win-release
 deps-windows:
 	tools/build_deps_windows.sh
+deps-android:
+	TMPDIR=/tmp bash tools/build_deps_android.sh
+ffx-android:
+	bash tools/build_ffx_android.sh
 dist:
 	@[ -f build/deps-win/lib/libavcodec.dll.a ] || { echo "make deps-windows first (LGPL FFmpeg)"; exit 1; }
 	@[ -d build/helper/lasgen ] || { echo "make gen-helper first (the game code generator)"; exit 1; }
@@ -224,6 +268,7 @@ dist:
 	cp third_party/fonts/Baloo2/OFL.txt "$(DIST)/Baloo2-OFL.txt"
 	cp third_party/fidelityfx/bin/amd_fidelityfx_vk.dll "$(DIST)/"  # (FSR 3.1, loaded at run time: without it, FSR 1)
 	cp third_party/fidelityfx/LICENSE.txt "$(DIST)/FidelityFX-LICENSE.txt"
+	cp third_party/snapdragon-gsr/LICENSE.txt "$(DIST)/SnapdragonGSR-LICENSE.txt"  # (its shader: vulkan/shaders.c present_gsr.frag)
 	cp LICENSE "$(DIST)/LICENSE.txt"
 	cp LICENSE-LASRecomp "$(DIST)/LICENSE-LASRecomp.txt"
 	cp docs/release-README.txt "$(DIST)/README.txt"
@@ -246,4 +291,4 @@ gen-helper:
 jogo:
 	tools/publicar_jogo.sh
 
-.PHONY: all gen gen-objs runtime-objs dist deps-windows gen-helper jogo
+.PHONY: all gen gen-objs runtime-objs dist deps-windows deps-android ffx-android gen-helper jogo

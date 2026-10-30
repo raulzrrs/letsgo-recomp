@@ -292,12 +292,20 @@ NVN(nvnMemoryPoolInitialize) {
     p->storage = G(uint64_t, A(1), 0x10);
     p->size = G(uint64_t, A(1), 0x18);
     p->flags = G(uint32_t, A(1), 8);
+    backend_pool_created(p->storage, p->size);
     SET_HOST(A(0), p);
     RET(1);
 }
 // Objects the game destroys (frame interpolation, exec.c: a recorded frame that may reference them is not replayed)
 uint64_t g_nvn_destroyed;
-NVN(nvnMemoryPoolFinalize) { g_nvn_destroyed++; rt_drain(); free(HOST(NvnPool, A(0))); SET_HOST(A(0), 0); }
+NVN(nvnMemoryPoolFinalize) {
+    g_nvn_destroyed++;
+    rt_drain();
+    NvnPool *p = HOST(NvnPool, A(0));
+    if (p) backend_pool_destroyed(p->storage, p->size);
+    free(p);
+    SET_HOST(A(0), 0);
+}
 NVN(nvnMemoryPoolSetDebugLabel) { (void)c; }
 NVN(nvnMemoryPoolMap) { RET(HOST(NvnPool, A(0))->storage); }
 NVN(nvnMemoryPoolGetBufferAddress) { RET(HOST(NvnPool, A(0))->storage); }  // GPU address == CPU address
@@ -855,7 +863,7 @@ NVN(nvnQueuePresentTexture) {
             if (*eq != '=') break;
             char *end;
             uint32_t v = (uint32_t)strtoull(eq + 1, &end, 0);
-            if (pa >= 0x7000000000ull && pa < 0x7800000000ull) *(uint32_t *)(uintptr_t)pa = v;
+            if (pa >= GUEST_LO && pa < GUEST_HI) *(uint32_t *)(uintptr_t)pa = v;
             p = *end == ';' ? end + 1 : end;
         }
     }

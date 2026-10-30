@@ -307,7 +307,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
     // 1. the generator, every module at once; their finished files are compiled while it goes on (bases: rt.h)
     enum { NGEN = 4 };
     Gen gens[NGEN] = {{.name = "main"}, {.name = "sdk"}, {.name = "subsdk0"}, {.name = "subsdk1"}};
-    static const char *const base[NGEN] = {"0x7000000000", "0x7004000000", "0x7006000000", "0x7008000000"};
+    const uint64_t bases[NGEN] = {MAIN_BASE, SDK_BASE, SUBSDK0_BASE, SUBSDK1_BASE};
     bool ok = true;
     for (int i = 0; i < NGEN && ok; i++) {
         Gen *g = &gens[i];
@@ -321,7 +321,9 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         if (t.gen_script[0]) add(&a, t.gen_script);
         add(&a, g->name);
         add(&a, nso);
-        add(&a, base[i]);
+        char base[24];
+        snprintf(base, sizeof base, "0x%llx", (unsigned long long)bases[i]);
+        add(&a, base);
         add(&a, g->out);
         if (i == 1) { add(&a, "--hle"); add(&a, t.hle); }
         g->p = spawn(a.v, g->log);

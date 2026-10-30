@@ -81,8 +81,10 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
     double h;
     int mode = g_settings.res_mode;
     if (forced > 0) h = forced;
-    // FSR 3.1: the window's resolution divided by its preset's ratio (the launcher's choice does not apply)
-    else if (g_settings.upscaler == UPSCALE_FSR3) h = (reshape ? dh / 1080.0 : fit) / settings_fsr3_ratio();
+    // FSR 3.1, DittoSR, DittoSR (FSR4): the window's resolution divided by its preset's ratio (the launcher's choice does
+    // not apply)
+    else if (g_settings.upscaler == UPSCALE_FSR3 || UPSCALE_IS_DITTOSR(g_settings.upscaler) || UPSCALE_IS_FSR4(g_settings.upscaler))
+        h = (reshape ? dh / 1080.0 : fit) / settings_fsr3_ratio();
     else if (g_settings.res_height > 0) h = g_settings.res_height / 1080.0;  // (the launcher's choice)
     else if (mode >= 1 && mode <= 8) h = mode;
     else {
@@ -99,7 +101,15 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
         else if (mode == RES_Q50) h *= 0.5;
     }
     h = fmax(h, 0.1);  // (.25x of a small window)
+    // The temporal upscalers: a scale that makes the Switch's 1920 x 1080 whole pixels, a multiple of 4 on each side.
+    // The render targets are rounded to whole pixels (textures.c) but the game draws at the exact scale: Balanced's
+    // 1 / 1.7 at 4K drew 2258.8 x 1270.6 into 2259 x 1271, a stretch the upscaler does not know of - its history blurred
+    // (FSR 3.1, GSR 2 and DittoSR (FSR4) alike). 4K Balanced: 2240 x 1260, 1.71x; the other presets were whole already.
+    bool snap = forced <= 0 && (g_settings.upscaler == UPSCALE_FSR3 || UPSCALE_IS_DITTOSR(g_settings.upscaler) ||
+                                UPSCALE_IS_FSR4(g_settings.upscaler));
+    if (snap && !reshape) h = fmax(round(h * 30) / 30, 1.0 / 30);
     double sx = h * shape, sy = h;
+    if (snap && reshape) sx = fmax(round(sx * 480) / 480, 1.0 / 480), sy = fmax(round(sy * 270) / 270, 1.0 / 270);
     double cap = fmin(MAX_TEX / (1920.0 * sx), MAX_TEX / (1080.0 * sy));
     if (cap < 1.0) { sx *= cap; sy *= cap; }
     o->sx = sx; o->sy = sy; o->shape = shape;

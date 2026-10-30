@@ -12,22 +12,29 @@
 
 // ---- address space layout (guest addresses == host addresses)
 // macOS reserves 0x2_0000_0000-0x70_0000_0000, and guest addresses must fit in 39 bits, so the
-// guest lives in a 12.5 GB window at 0x70_0000_0000 claimed at startup (see main.c).
+// guest lives in a 12.5 GB window at 0x70_0000_0000 claimed at startup (see main.c). GUEST_LO moves the whole window
+// (-DGUEST_LO=...: Android's app processes have zygote's native heap there); the game code is generated for it
+// (runtime/gamebuild.c passes the module bases), the game being position independent.
+#ifndef GUEST_LO
 #define GUEST_LO     0x7000000000ull
-#define GUEST_HI     0x7320000000ull
-#define MAIN_BASE    0x7000000000ull
-#define SDK_BASE     0x7004000000ull
-#define SUBSDK0_BASE 0x7006000000ull   // Let's Go: glslc (runtime GLSL -> Maxwell compiler)
-#define SUBSDK1_BASE 0x7008000000ull   // Let's Go: multimedia (movie::)
-#define HLE_BASE     0x7080000000ull   // fake addresses for host-implemented functions
+#endif
+// The canonical layout (GUEST_LO 0x70_0000_0000): the addresses in the runtime's sources, tools/ and docs/ (Let's Go
+// Eevee 1.0.0's main at 0x70_0000_0000). GA() puts one in this build's window; rt_addr (fnhook.c) does it for functions.
+#define GA(a)        ((uint64_t)(a) - 0x7000000000ull + GUEST_LO)
+#define GUEST_HI     GA(0x7320000000ull)
+#define MAIN_BASE    GA(0x7000000000ull)
+#define SDK_BASE     GA(0x7004000000ull)
+#define SUBSDK0_BASE GA(0x7006000000ull)   // Let's Go: glslc (runtime GLSL -> Maxwell compiler)
+#define SUBSDK1_BASE GA(0x7008000000ull)   // Let's Go: multimedia (movie::)
+#define HLE_BASE     GA(0x7080000000ull)   // fake addresses for host-implemented functions
 #define HLE_SIZE     0x0000100000ull
-#define TLS_BASE     0x7090000000ull
+#define TLS_BASE     GA(0x7090000000ull)
 #define TLS_SIZE     0x0000100000ull
-#define HLE_HEAP     0x7092000000ull   // guest-visible memory owned by host code
+#define HLE_HEAP     GA(0x7092000000ull)   // guest-visible memory owned by host code
 #define HLE_HEAP_SIZE 0x000E000000ull
-#define ALIAS_BASE   0x7100000000ull   // alias region (svcMapMemory targets)
+#define ALIAS_BASE   GA(0x7100000000ull)   // alias region (svcMapMemory targets)
 #define ALIAS_SIZE   0x0100000000ull
-#define HEAP_BASE    0x7240000000ull
+#define HEAP_BASE    GA(0x7240000000ull)
 #define HEAP_MAX     0x00D0000000ull   // 3.25 GB
 
 // ---- loader.c

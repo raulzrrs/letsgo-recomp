@@ -103,6 +103,63 @@ static SDL_Window *mouse_win;
 static _Atomic int gyro_aiming;  // the game has the motion sensor started (aiming): the mouse turns the gyro
 static _Atomic int64_t mouse_acc_x, mouse_acc_y;  // motion not yet applied to the virtual gyro, in 1/1000 pixel
 static _Atomic int touch_down;
+
+// Gyro aiming (g_settings.gyro_aim): while the game aims, a real gyroscope turns the virtual one (six_axis_fill) as the
+// mouse does - the controller's when it has one (DualSense, DualShock 4, Switch Pro, Joy-Con), else the device's own
+// (a phone or tablet). Opened only while aiming (input_poll); its turns since the last read, about the screen's up and
+// right axes, in 1e-7 radians. The device's sensor reads in its natural (portrait) frame: x right, y up, z towards the
+// player; held in landscape, the screen's up is its +x (right side up) or -x. A controller's, held in front of the
+// player, is already the screen's. LARECOMP_GYRO_SENS=<k> scales the turn (research); negative flips it.
+static SDL_Sensor *dev_gyro;
+static bool pad_gyro;
+static _Atomic int64_t gyro_acc_yaw, gyro_acc_pitch;
+static uint64_t gyro_last_ts;
+static void gyro_add(float yaw_rate, float pitch_rate, uint64_t ts) {  // rad/s about the screen's up / right axes
+    double dt = gyro_last_ts && ts > gyro_last_ts ? (ts - gyro_last_ts) / 1e9 : 0;
+    gyro_last_ts = ts;
+    if (dt <= 0 || dt > 0.1) return;
+    gyro_acc_yaw += (int64_t)(yaw_rate * dt * 1e7);
+    gyro_acc_pitch += (int64_t)(pitch_rate * dt * 1e7);
+}
+// Main thread, every pass of the event loop (runtime/nvn/vulkan/device.c ui_run). LARECOMP_GYRO_PROBE=1 (tests): the
+// gyroscope on from the start, its turn so far logged each second (degrees: yaw left +, pitch up +)
+static int gyro_probe = -1;
+void input_poll(void) {
+    if (gyro_probe < 0) gyro_probe = getenv("LARECOMP_GYRO_PROBE") != NULL;
+    if (gyro_probe) {
+        static uint64_t last;
+        static double yaw, pitch;
+        uint64_t now = SDL_GetTicksNS();
+        if (now - last > 1000000000ull) {
+            yaw += atomic_exchange(&gyro_acc_yaw, 0) * 1e-7 * 180 / M_PI, pitch += atomic_exchange(&gyro_acc_pitch, 0) * 1e-7 * 180 / M_PI;
+            if (last) LOG("[input] gyro probe: yaw %.2f pitch %.2f degrees (orientation %d)\n", yaw, pitch,
+                          (int)SDL_GetCurrentDisplayOrientation(SDL_GetPrimaryDisplay()));
+            last = now;
+        }
+    }
+    bool want = (g_settings.gyro_aim && gyro_aiming) || gyro_probe;
+    bool pad_has = pad && SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO);
+    if (pad_has && want != pad_gyro) {
+        SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, want);
+        pad_gyro = want, gyro_last_ts = 0;
+        LOG("[input] gyro aiming: %s's gyroscope %s\n", SDL_GetGamepadName(pad), want ? "on" : "off");
+    }
+    bool want_dev = want && !pad_has;
+    if (want_dev && !dev_gyro) {
+        static bool none;
+        int n = 0;
+        SDL_SensorID *ids = none ? NULL : SDL_GetSensors(&n);
+        for (int i = 0; i < n && !dev_gyro; i++)
+            if (SDL_GetSensorTypeForID(ids[i]) == SDL_SENSOR_GYRO) dev_gyro = SDL_OpenSensor(ids[i]);
+        SDL_free(ids);
+        if (dev_gyro) LOG("[input] gyro aiming: the device's gyroscope (%s)\n", SDL_GetSensorName(dev_gyro));
+        else if (!none) none = true, LOG("[input] gyro aiming: no gyroscope on this device\n");
+        gyro_last_ts = 0;
+    } else if (!want_dev && dev_gyro) {
+        SDL_CloseSensor(dev_gyro);
+        dev_gyro = NULL;
+    }
+}
 static void mouse_release(void) {
     if (mouse_win) SDL_SetWindowRelativeMouseMode(mouse_win, false);
     mouse_win = NULL;
@@ -115,6 +172,7 @@ static void mouse_release(void) {
 // 1280 x 720: in those, the berry button sat 2/3 of the way to where it was drawn and never opened.
 // g_present_rect: where the image is drawn in the window, in pixels (runtime/nvn/vulkan/device.c).
 double g_present_rect[4] = {0, 0, 1280, 720};
+double g_image_rect[4] = {0, 0, 1280, 720};  // (the whole image: with ultrawide, the window's, wider than the box above)
 static double touch_w(void) {
     static double w = 0;
     if (!w) w = getenv("LARECOMP_DISPLAY_W") ? atoi(getenv("LARECOMP_DISPLAY_W")) : 1920;
@@ -268,8 +326,20 @@ void input_handle_event(const SDL_Event *e) {
     case SDL_EVENT_GAMEPAD_ADDED:
         if (!pad) { pad = SDL_OpenGamepad(e->gdevice.which); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
         break;
+    case SDL_EVENT_SENSOR_UPDATE:  // (gyro aiming: the device's gyroscope)
+        if (dev_gyro && e->sensor.which == SDL_GetSensorID(dev_gyro)) {
+            const float *g = e->sensor.data;
+            SDL_DisplayOrientation o = SDL_GetCurrentDisplayOrientation(SDL_GetPrimaryDisplay());
+            if (o == SDL_ORIENTATION_LANDSCAPE) gyro_add(g[0], -g[1], e->sensor.sensor_timestamp);
+            else if (o == SDL_ORIENTATION_LANDSCAPE_FLIPPED) gyro_add(-g[0], g[1], e->sensor.sensor_timestamp);
+            else gyro_add(g[1], g[0], e->sensor.sensor_timestamp);
+        }
+        break;
+    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:  // (gyro aiming: the controller's)
+        if (pad_gyro && e->gsensor.sensor == SDL_SENSOR_GYRO) gyro_add(e->gsensor.data[1], e->gsensor.data[0], e->gsensor.sensor_timestamp);
+        break;
     case SDL_EVENT_GAMEPAD_REMOVED:
-        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) { SDL_CloseGamepad(pad); pad = NULL; note_family(); }
+        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) { SDL_CloseGamepad(pad); pad = NULL; pad_gyro = false; note_family(); }
         recompute_pad();
         break;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP:
@@ -869,6 +939,11 @@ static void six_axis_fill(uint8_t *s, int64_t sampling) {
         double k = g_settings.mouse_sens * M_PI / 180 / 1000;  // degrees per pixel
         gyro_yaw -= atomic_exchange(&mouse_acc_x, 0) * k;
         gyro_pitch -= atomic_exchange(&mouse_acc_y, 0) * k;
+        // a real gyroscope's turns (input_poll): left (counterclockwise seen from above) and up positive, as here
+        static double gs = 0;
+        if (gs == 0) gs = getenv("LARECOMP_GYRO_SENS") ? atof(getenv("LARECOMP_GYRO_SENS")) : 1.0;
+        gyro_yaw += atomic_exchange(&gyro_acc_yaw, 0) * 1e-7 * gs;
+        gyro_pitch += atomic_exchange(&gyro_acc_pitch, 0) * 1e-7 * gs;
         double lim = 80 * M_PI / 180;
         if (gyro_pitch > lim) gyro_pitch = lim;
         if (gyro_pitch < -lim) gyro_pitch = -lim;
@@ -906,6 +981,8 @@ HLE_FUNC("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", hid_six_
     gyro_yaw = gyro_pitch = 0;
     atomic_store(&mouse_acc_x, 0);
     atomic_store(&mouse_acc_y, 0);
+    atomic_store(&gyro_acc_yaw, 0);
+    atomic_store(&gyro_acc_pitch, 0);
     extern uint64_t renderer_game_frame(void);
     LOG("[input] six-axis sensor started (frame %llu)\n", (unsigned long long)renderer_game_frame());
 }

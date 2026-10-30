@@ -106,15 +106,41 @@ static void opus_decoder(Service *s, IpcReq *req, IpcResp *resp) {
     }
 }
 
-static void opus_decoder_close(Service *s) {
-    OpusDec *d = s->state;
-    if (!d) return;
+// Closed decoders wait here to be opened again: the game opens one for a sound and closes it after, thousands a second
+// at times (a phone: 2500 / s for minutes), and each FFmpeg decoder made from nothing cost its avcodec_open2. One of
+// the same channel count is taken back instead, its state flushed (a new stream).
+#define POOL 16
+static OpusDec *pool[POOL];
+static int npool;
+static pthread_mutex_t pool_lk = PTHREAD_MUTEX_INITIALIZER;
+static void opus_free(OpusDec *d) {
     avcodec_free_context(&d->ctx);
     av_packet_free(&d->pkt);
     av_frame_free(&d->frame);
     pthread_mutex_destroy(&d->lock);
     free(d);
+}
+static OpusDec *pool_take(uint32_t rate, uint32_t channels) {
+    OpusDec *d = NULL;
+    pthread_mutex_lock(&pool_lk);
+    for (int i = npool - 1; i >= 0 && !d; i--)
+        if (pool[i]->channels == channels) d = pool[i], pool[i] = pool[--npool];
+    pthread_mutex_unlock(&pool_lk);
+    if (d) d->rate = rate, avcodec_flush_buffers(d->ctx);
+    return d;
+}
+
+static void opus_decoder_close(Service *s) {
+    OpusDec *d = s->state;
+    if (!d) return;
     s->state = NULL;
+    pthread_mutex_lock(&pool_lk);
+    if (npool < POOL) pool[npool++] = d, d = NULL;
+    pthread_mutex_unlock(&pool_lk);
+    if (d) opus_free(d);
+}
+RT_ON_RESET(hwopus_reset) {  // (an in-place reboot: the pool emptied)
+    while (npool) opus_free(pool[--npool]);
 }
 
 // What a decoder of this many channels needs on the console (any non-zero size works: the work buffer is unused).
@@ -124,7 +150,14 @@ SERVICE("hwopus", hwopus) {
     (void)s;
     switch (req->cmd) {
     case 0: {  // OpenHardwareOpusDecoder(params, work size, transfer memory)
-        OpusDec *d = calloc(1, sizeof *d);
+        OpusDec *d = pool_take(IN(uint32_t, 0), IN(uint32_t, 4));
+        if (d) {
+            Service *dec = service_new("IHardwareOpusDecoder", opus_decoder, d);
+            dec->on_close = opus_decoder_close;
+            ipc_return_object(resp, dec);
+            break;
+        }
+        d = calloc(1, sizeof *d);
         d->rate = IN(uint32_t, 0);
         d->channels = IN(uint32_t, 4);
         pthread_mutex_init(&d->lock, NULL);

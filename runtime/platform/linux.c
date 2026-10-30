@@ -1,9 +1,14 @@
-// Linux host layer (runtime/platform.h). x86-64 and aarch64.
+// Linux host layer (runtime/platform.h). x86-64 and aarch64; Android too (__ANDROID__: the runtime is libmain.so, started by
+// SDL's Java activity, its data in the app's external files folder).
 #define _GNU_SOURCE
 #include <SDL3/SDL.h>
 #include <dlfcn.h>
 #include <errno.h>
+#ifndef __ANDROID__
 #include <execinfo.h>
+#else
+#include <unwind.h>
+#endif
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
@@ -18,6 +23,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../paths.h"
 #include "../platform.h"
 
 #ifndef MAP_FIXED_NOREPLACE
@@ -55,6 +61,12 @@ int plat_protect(uint64_t addr, uint64_t size, int prot) {
 uint64_t plat_now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+
+uint64_t plat_process_cpu_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
     return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
 }
 
@@ -117,13 +129,46 @@ static void require_cpu(void) {
 static void require_cpu(void) {}
 #endif
 
+#ifdef __ANDROID__
+// The data root is the app's external files folder (/sdcard/Android/data/<app>/files: game files and saves pushed or
+// copied there, readable with a file manager); the game code library is next to this one (the APK's native libraries).
+// Landscape either way round, as the manifest says (screenOrientation sensorLandscape).
+static void android_init(void) {
+    const char *ext = SDL_GetAndroidExternalStoragePath();
+    if (ext && !getenv("LARECOMP_DATA_ROOT")) setenv("LARECOMP_DATA_ROOT", ext, 1);
+    char lib[1024];
+    if (!getenv("LARECOMP_GAME_LIB") && plat_exe_path(lib, sizeof lib)) {
+        char *s = strrchr(lib, '/');
+        if (s) {
+            snprintf(s + 1, sizeof lib - (size_t)(s + 1 - lib), "liblasgame.so");
+            struct stat st;
+            if (stat(lib, &st) == 0) setenv("LARECOMP_GAME_LIB", lib, 1);
+        }
+    }
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+}
+#endif
+
 void plat_init(void) {
+#ifdef __ANDROID__
+    android_init();
+#endif
     log_to_file_without_terminal();
     require_cpu();
+#ifdef __ANDROID__
+    const char *lib = getenv("LARECOMP_GAME_LIB");
+    fprintf(stderr, "[android] game code: %s\n", lib ? lib : "not next to libmain.so");
+#endif
 }
 
 // (inside an AppImage: the binary in its mount, which stays mounted while this process lives - re-exec included)
 bool plat_exe_path(char *buf, size_t size) {
+#ifdef __ANDROID__  // (the process is Android's app_process: this library's file instead, in the APK's native libraries)
+    Dl_info di = {0};
+    if (!dladdr((void *)plat_exe_path, &di) || !di.dli_fname) return false;
+    snprintf(buf, size, "%s", di.dli_fname);
+    return true;
+#endif
     ssize_t n = readlink("/proc/self/exe", buf, size - 1);
     if (n <= 0) return false;
     buf[n] = 0;
@@ -147,6 +192,10 @@ static char **self_argv(void) {
 }
 
 void plat_exec(char *const argv[]) {
+#ifdef __ANDROID__
+    (void)argv;  // (an app process can't replace itself: the caller reports the failure)
+    return;
+#endif
     if (argv) { execv(argv[0], argv); return; }
     char path[4096];
     char **av = self_argv();
@@ -174,6 +223,21 @@ void plat_fatal_notice(void) {
 }
 
 const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);  // runtime/dispatch.c
+
+#ifdef __ANDROID__  // (Bionic has backtrace() from API 33 only)
+typedef struct { void **bt; int n, max; } Unwound;
+static _Unwind_Reason_Code unwind_one(struct _Unwind_Context *ctx, void *arg) {
+    Unwound *u = arg;
+    uintptr_t pc = _Unwind_GetIP(ctx);
+    if (pc && u->n < u->max) u->bt[u->n++] = (void *)pc;
+    return u->n < u->max ? _URC_NO_REASON : _URC_END_OF_STACK;
+}
+static int backtrace(void **bt, int max) {
+    Unwound u = {bt, 0, max};
+    _Unwind_Backtrace(unwind_one, &u);
+    return u.n;
+}
+#endif
 
 void plat_print_backtrace(void) {
     void *bt[64];

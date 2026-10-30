@@ -387,7 +387,7 @@ NVN(nvnCommandBufferDrawArraysInstanced) { draw_chain(c, "arrays_inst", c->x[3])
 static bool trace_list(uint64_t h) { for (int i = 0; i < g_ntrace_list; i++) if (g_trace_list[i] == h) return true; return false; }
 static void trace_chain(Cpu *c) {
     uint64_t fp = c->x[29];
-    for (int i = 0; i < 14 && fp >= 0x7000000000ull && fp < 0x8000000000ull && (fp & 7) == 0; i++) {
+    for (int i = 0; i < 14 && fp >= GUEST_LO && fp < GUEST_HI && (fp & 7) == 0; i++) {
         uint64_t next = *(uint64_t *)(uintptr_t)fp, lr = *(uint64_t *)(uintptr_t)(fp + 8);
         LOG(" %llx", (unsigned long long)lr);
         if (next <= fp) break;
@@ -405,7 +405,7 @@ static void trace_draw(Cpu *c, uint64_t count) {
     extern uint64_t renderer_game_frame(void);
     LOG("[trace] f%llu draw count %llu lr %llx chain:", (unsigned long long)renderer_game_frame(), (unsigned long long)count, (unsigned long long)c->x[30]);
     uint64_t fp = c->x[29];
-    for (int i = 0; i < 14 && fp >= 0x7000000000ull && fp < 0x8000000000ull && (fp & 7) == 0; i++) {
+    for (int i = 0; i < 14 && fp >= GUEST_LO && fp < GUEST_HI && (fp & 7) == 0; i++) {
         uint64_t next = *(uint64_t *)(uintptr_t)fp, lr = *(uint64_t *)(uintptr_t)(fp + 8);
         LOG(" %llx", (unsigned long long)lr);
         if (next <= fp) break;
@@ -437,7 +437,7 @@ static void draw_chain(Cpu *c, const char *kind, uint64_t count) {
                        n++, kind, (unsigned long long)count, (unsigned long long)c->x[0], (unsigned long long)g_obj_tag);
     uint64_t fp = c->x[29];
     len += snprintf(line + len, sizeof line - len, " %llx", (unsigned long long)c->x[30]);
-    for (int i = 0; i < 16 && fp >= 0x7000000000ull && fp < 0x8000000000ull && (fp & 7) == 0; i++) {
+    for (int i = 0; i < 16 && fp >= GUEST_LO && fp < GUEST_HI && (fp & 7) == 0; i++) {
         uint64_t next = *(uint64_t *)(uintptr_t)fp, lr = *(uint64_t *)(uintptr_t)(fp + 8);
         if (len < (int)sizeof line - 20) len += snprintf(line + len, sizeof line - len, " %llx", (unsigned long long)lr);
         if (next <= fp) break;

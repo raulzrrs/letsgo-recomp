@@ -1,4 +1,6 @@
 // IPC message parsing/serialization and session management.
+#include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -60,6 +62,25 @@ uint32_t ipc_connect_named_port(const char *name) {
     return 0;
 }
 
+// Sessions opened and closed over and over (Let's Go: an Opus decoder for a sound, thousands a second at times) are
+// logged their first 16 times by name, then once every 100000: three lines each filled a phone's log with 60 MB in
+// minutes, written to its storage while the game ran.
+static bool ipc_log_quota(const char *name) {
+    static struct { char name[32]; uint64_t n; } seen[64];
+    static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lk);
+    int i = 0;
+    while (i < 64 && seen[i].name[0] && strncmp(seen[i].name, name, 31)) i++;
+    uint64_t n = 0;
+    if (i < 64) {
+        if (!seen[i].name[0]) snprintf(seen[i].name, sizeof seen[i].name, "%s", name);
+        n = ++seen[i].n;
+    }
+    pthread_mutex_unlock(&lk);
+    if (n == 17) LOG("[ipc] %s: opened / closed again and again - logged once every 100000 from here\n", name);
+    return n <= 16 || n % 100000 == 0;
+}
+
 // ------------------------------------------------------------------ sm:
 SERVICE("sm:", sm_handler) {
     (void)s;
@@ -69,7 +90,7 @@ SERVICE("sm:", sm_handler) {
     case 1: {  // GetServiceHandle(name)
         char name[9] = {0};
         memcpy(name, req->data, 8);
-        LOG("[sm] GetService %s\n", name);
+        if (ipc_log_quota(name)) LOG("[sm] GetService %s\n", name);
         ipc_return_object(resp, service_lookup(name));
         break;
     }
@@ -135,7 +156,7 @@ int ipc_handle_request(Cpu *c, uint32_t handle) {
     }
 
     if (req.type == 2) {  // close
-        LOG("[ipc] close session %s (handle %x)\n", sess->svc->name, handle);
+        if (ipc_log_quota(sess->svc->name)) LOG("[ipc] close session %s (handle %x)\n", sess->svc->name, handle);
         if (!sess->domain) service_release(sess->svc);  // (a domain's objects stay: closed one by one)
         return 0;
     }

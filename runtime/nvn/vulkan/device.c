@@ -164,24 +164,46 @@ static void create_device(void) {
                     has_ext(ep, ne, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
     if (g_present_log) ext[n_ext++] = VK_KHR_PRESENT_ID_EXTENSION_NAME, ext[n_ext++] = VK_KHR_PRESENT_WAIT_EXTENSION_NAME;
     else if (getenv("LARECOMP_PRESENT_LOG")) LOG("[vk] LARECOMP_PRESENT_LOG: the driver has no VK_KHR_present_wait\n");
-    g_vk.custom_border = has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+    // what the device has: an extension can be listed with its feature off (Adreno), and a feature asked for that the
+    // device lacks fails vkCreateDevice (VK_ERROR_FEATURE_NOT_PRESENT)
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT have_cbc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+    VkPhysicalDeviceFaultFeaturesEXT have_ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    VkPhysicalDeviceVulkan13Features have13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features have12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &have13};
+    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have12};
+    // (compute shader derivatives - the NV extension's structure: the KHR one has the same type value)
+    const char *deriv_ext = has_ext(ep, ne, "VK_KHR_compute_shader_derivatives") ? "VK_KHR_compute_shader_derivatives" :
+                            has_ext(ep, ne, VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME) ? VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME : NULL;
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesNV have_deriv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_NV};
+    if (deriv_ext) have_deriv.pNext = have.pNext, have.pNext = &have_deriv;
+    if (has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME)) have_cbc.pNext = have.pNext, have.pNext = &have_cbc;
+    if (has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) have_ff.pNext = have.pNext, have.pNext = &have_ff;
+    vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+    // (custom border colours with the format left out: textures.c sampler_create)
+    g_vk.custom_border = have_cbc.customBorderColors && have_cbc.customBorderColorWithoutFormat;
     if (g_vk.custom_border) ext[n_ext++] = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
     g_vk.divisor = has_ext(ep, ne, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
     if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
     g_vk.host_import = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);  // guest heap as a GPU buffer (exec.c)
     if (g_vk.host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
-    bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
+#ifdef __ANDROID__  // (no host memory import there: the heap goes into GPU memory instead, exec.c renderer_share_heap;
+    // its memory pools are reached by shaders through buffer device addresses)
+    g_vk.heap_export = !g_vk.host_import && have12.bufferDeviceAddress;
+    if (g_vk.heap_export && has_ext(ep, ne, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) ext[n_ext++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+#endif
+    bool fault = have_ff.deviceFault;  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     // LARECOMP_PIPE_STATS: what the driver says about each compiled shader (registers, spills, ...), exec.c pipe_exec_report
     g_pipe_exec_stats = getenv("LARECOMP_PIPE_STATS") && has_ext(ep, ne, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     if (g_pipe_exec_stats) ext[n_ext++] = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
     else if (getenv("LARECOMP_PIPE_STATS")) LOG("[vk] LARECOMP_PIPE_STATS: the driver has no VK_KHR_pipeline_executable_properties\n");
     g_fault_ext = fault;
+    // (compute shaders of machine-learning upscalers: derivatives in groups of quads; with 8-bit dot products, below)
+    bool deriv = deriv_ext && have_deriv.computeDerivativeGroupQuads;
+    if (deriv) ext[n_ext++] = deriv_ext;
     free(ep);
 
     // features the backend relies on (all present on current desktop drivers)
-    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT div = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
         .vertexAttributeInstanceRateDivisor = VK_TRUE, .vertexAttributeInstanceRateZeroDivisor = VK_FALSE};
@@ -191,12 +213,16 @@ static void create_device(void) {
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
                                             .dynamicRendering = VK_TRUE, .synchronization2 = VK_TRUE,
                                             .shaderDemoteToHelperInvocation = VK_TRUE, .shaderTerminateInvocation = VK_TRUE,
-                                            .maintenance4 = VK_TRUE,
+                                            .maintenance4 = VK_TRUE, .shaderIntegerDotProduct = have13.shaderIntegerDotProduct,
                                             .pNext = g_vk.custom_border ? (void *)&cbc : g_vk.divisor ? (void *)&div : NULL};
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                             .timelineSemaphore = VK_TRUE, .shaderInt8 = VK_TRUE, .samplerMirrorClampToEdge = VK_TRUE,
-                                            .uniformAndStorageBuffer8BitAccess = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE,
-                                            .scalarBlockLayout = VK_TRUE, .pNext = &f13};
+                                            // (8-bit uniform buffers: no shader of ours uses them; Adreno has none)
+                                            .uniformAndStorageBuffer8BitAccess = have12.uniformAndStorageBuffer8BitAccess,
+                                            .storageBuffer8BitAccess = VK_TRUE,
+                                            // (FSR 3.1's 16-bit shader variants, which it picks where the GPU has them)
+                                            .shaderFloat16 = have12.shaderFloat16,
+                                            .scalarBlockLayout = VK_TRUE, .bufferDeviceAddress = g_vk.heap_export, .pNext = &f13};
     VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                                             .storageBuffer16BitAccess = VK_TRUE, .pNext = &f12};
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
@@ -211,6 +237,10 @@ static void create_device(void) {
     VkPhysicalDevicePresentIdFeaturesKHR pid = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
                                                 .presentId = VK_TRUE, .pNext = &pw};
     if (g_present_log) f.pNext = &pid;
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesNV dq = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_NV,
+                                                             .computeDerivativeGroupQuads = VK_TRUE, .pNext = f.pNext};
+    if (deriv) f.pNext = &dq;
+    LOG("[vk] 8-bit dot products %s, compute derivatives %s\n", have13.shaderIntegerDotProduct ? "on" : "no", deriv ? deriv_ext : "no");
     VkPhysicalDeviceFeatures *b = &f.features, *h = &have.features;
     b->independentBlend = h->independentBlend;
     b->dualSrcBlend = h->dualSrcBlend;
@@ -326,6 +356,12 @@ static void create_swapchain(void) {
     SDL_GetWindowSizeInPixels(window, &w, &h);
     VkExtent2D ext = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent : (VkExtent2D){(uint32_t)w, (uint32_t)h};
     if (!ext.width || !ext.height) return;  // minimised
+    VkSurfaceTransformFlagBitsKHR pre = caps.currentTransform;
+#ifdef __ANDROID__
+    // Android gives the window's size in landscape and the turn from the display's own (portrait) orientation: the
+    // images are drawn as they are and the compositor turns them (either way round: only the transform changes)
+    pre = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+#endif
     uint32_t nf = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(g_vk.phys, g_vk.surface, &nf, NULL);
     VkSurfaceFormatKHR fmts[64];
@@ -344,7 +380,7 @@ static void create_swapchain(void) {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = g_vk.surface, .minImageCount = count,
         .imageFormat = sf.format, .imageColorSpace = sf.colorSpace, .imageExtent = ext, .imageArrayLayers = 1,
         .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = pre,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = present_mode(), .clipped = VK_TRUE,
         .oldSwapchain = old};
     VK_CHECK(vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain));
@@ -371,6 +407,57 @@ static void recreate_swapchain(void) {
     g_sc_stale = false;
     pthread_mutex_unlock(&sc_lk);
 }
+#ifdef __ANDROID__
+// Android takes the window's surface away when the app goes to the background (the screen locked, another app on top)
+// and gives a new one when it comes back: nothing is shown meanwhile, and then the swapchain is made on a surface of the
+// new window (vk_frame_begin). Without it the game went on (its sound too) behind a black screen. An event watch: it
+// sees the events whichever loop takes them (the start screen's, the game's).
+static _Atomic int g_background, g_surface_new;
+static void android_frame_rate(void);  // (below: the display's refresh for the frame generation)
+// The window losing the focus without going to the background (the system's overlays: the notification shade, a
+// game toolbox, a screen keyboard) left the game slow or frozen - its sound going on - until it went to the desktop
+// and back: the focus coming back makes the surface again too, as coming back does. Logged, with the window's other
+// changes, to see what the system did.
+static _Atomic int g_focus_lost;
+static bool SDLCALL lifecycle_watch(void *ud, SDL_Event *e) {
+    (void)ud;
+    const char *what = NULL;
+    switch (e->type) {
+    case SDL_EVENT_WILL_ENTER_BACKGROUND: g_background = 1; what = "to the background"; break;
+    case SDL_EVENT_DID_ENTER_FOREGROUND: g_surface_new = 1, g_background = 0; what = "back to the foreground"; break;
+    case SDL_EVENT_WINDOW_FOCUS_LOST: g_focus_lost = 1; what = "focus lost"; break;
+    case SDL_EVENT_WINDOW_FOCUS_GAINED:
+        what = "focus back";
+        if (g_focus_lost) g_focus_lost = 0, g_surface_new = 1;
+        break;
+    case SDL_EVENT_WINDOW_OCCLUDED: what = "occluded"; break;
+    case SDL_EVENT_WINDOW_EXPOSED: what = "exposed"; break;
+    case SDL_EVENT_WINDOW_HIDDEN: what = "hidden"; break;
+    case SDL_EVENT_WINDOW_SHOWN: what = "shown"; break;
+    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: what = "pixel size changed"; break;
+    case SDL_EVENT_WINDOW_SAFE_AREA_CHANGED: what = "safe area changed"; break;
+    default: break;
+    }
+    if (what) LOG("[android] window: %s\n", what);
+    return true;
+}
+static void surface_again(void) {
+    pthread_mutex_lock(&sc_lk);
+    vkDeviceWaitIdle(g_vk.dev);
+    for (uint32_t i = 0; i < g_vk.sc_count; i++) vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
+    g_vk.sc_count = 0;
+    if (g_vk.swapchain) vkDestroySwapchainKHR(g_vk.dev, g_vk.swapchain, NULL);
+    g_vk.swapchain = VK_NULL_HANDLE;
+    vkDestroySurfaceKHR(g_vk.inst, g_vk.surface, NULL);
+    g_vk.surface = VK_NULL_HANDLE;
+    if (SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) create_swapchain();
+    else g_vk.surface = VK_NULL_HANDLE, g_surface_new = 1;  // (the new window may not be there yet: the next frame tries again)
+    g_sc_gen++;
+    g_sc_stale = false;
+    pthread_mutex_unlock(&sc_lk);
+    LOG("[vk] back from the background: swapchain made again (%ux%u)\n", g_vk.sc_extent.width, g_vk.sc_extent.height);
+}
+#endif
 // Acquire a window image without waiting while holding sc_lk (the present thread may need it to free one)
 static VkResult acquire_image(VkSemaphore sem, uint32_t *img) {
     for (int tries = 0;; tries++) {
@@ -419,6 +506,12 @@ bool vk_frame_begin(const float clear[4]) {
     int w, h;
     SDL_GetWindowSizeInPixels(window, &w, &h);
     if (!w || !h) return false;  // minimised
+#ifdef __ANDROID__
+    if (g_background) return false;
+    if (g_surface_new) g_surface_new = 0, surface_again();
+    if (!g_vk.surface) return false;
+    android_frame_rate();
+#endif
     if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height) recreate_swapchain();
     if (!g_vk.swapchain) return false;
     static int trace = -1;
@@ -436,6 +529,11 @@ bool vk_frame_begin(const float clear[4]) {
     static unsigned acquire_fails;  // (a window the driver keeps reporting out of date: logged once per 600, not every frame)
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
         if (acquire_fails++ % 600 == 0) LOG("[vk] acquire failed: %d (%u times)\n", r, acquire_fails);
+#ifdef __ANDROID__
+        // (no image for seconds - acquire_image gives up after ~4 s: the window stopped taking them; a new surface,
+        // as coming back from the desktop gives)
+        if (r == VK_NOT_READY || r == VK_TIMEOUT) g_surface_new = 1, LOG("[vk] no window image for seconds: surface made again\n");
+#endif
         return false;
     }
     acquire_fails = 0;
@@ -561,6 +659,11 @@ static void present_swap_image(uint32_t img, VkQueue q, uint64_t frame, int imag
         pthread_mutex_unlock(&pl_lk);
     }
     if (trace) LOG("[vk] presented: %d\n", r);
+#ifdef __ANDROID__
+    // (suboptimal on every present there: the images are not turned for the display on purpose, create_swapchain - not
+    // a reason to make the swapchain again, which waited for the GPU every frame: the game, this thread and the GPU in turn)
+    if (r == VK_SUBOPTIMAL_KHR) r = VK_SUCCESS;
+#endif
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
         if (other_thread) g_sc_stale = true;
         else recreate_swapchain();
@@ -631,6 +734,13 @@ static bool shot_raw(const char *path, const uint8_t *rgba, uint32_t w, uint32_t
 
 void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
     if (shot_raw(path, rgba, w, h)) return;
+#ifdef __ANDROID__
+    // (SDL opens a relative path among the APK's assets on Android: the shots go under the data root instead, the
+    // folder the runtime works in)
+    extern const char *rt_data_root(void);
+    char abs[1024];
+    if (path[0] != '/' && rt_data_root()) snprintf(abs, sizeof abs, "%s/%s", rt_data_root(), path), path = abs;
+#endif
     SDL_Surface *s = SDL_CreateSurfaceFrom((int)w, (int)h, SDL_PIXELFORMAT_ABGR8888, (void *)rgba, (int)w * 4);
     if (!s || !SDL_SavePNG(s, path)) LOG("[vk] saving %s failed: %s\n", path, SDL_GetError());
     else LOG("[vk] saved %s (%ux%u)\n", path, w, h);
@@ -648,6 +758,7 @@ void renderer_save_texture_tex(TexBackend *b, const char *path);
 static uint64_t frames, total_frames, g_frame_counter;
 static uint64_t g_window_images;  // (images presented: present_image)
 uint64_t renderer_present_count(void) { return total_frames; }
+uint64_t renderer_window_images(void) { return g_window_images; }  // (the performance overlay's frame rate)
 uint64_t vk_frame_counter(void) { return g_frame_counter; }
 static float g_shot_crop[4] = {0, 0, 1, 1};
 static double last_fps_time;
@@ -681,12 +792,20 @@ static void present_image(TexBackend *b, bool final, int image, int nimg, uint64
         // render scale + placement in the window (the game's 16:9 image, fitted): runtime/nvn/output_scale.c;
         // no GPU timer here (-1): dynamic resolution goes by the frame time
         OutScale os;
-        output_scale(dw, dh, false, SDL_GetTicksNS() / 1e9, -1, &os);
+        // (wide screens, prototype: runtime/hle/widescreen.c - the image fills a window wider than 16:9, the camera widened)
+        extern float widescreen_aspect(void);
+        extern void widescreen_window(double w, double h);
+        widescreen_window(dw, dh);
+        bool wide = widescreen_aspect() > 1.0f;
+        output_scale(dw, dh, wide, SDL_GetTicksNS() / 1e9, -1, &os);
         double sx = os.sx, sy = os.sy, vx = os.vx, vy = os.vy, vw = os.vw, vh = os.vh;
         float crop[4] = {0, 0, 1, 1};  // uv origin and size: the whole image
-        {   // where the game image is in the window (pixels): the mouse as a finger on the touch screen (hle/input.c)
-            extern double g_present_rect[4];
-            g_present_rect[0] = vx, g_present_rect[1] = vy, g_present_rect[2] = vw, g_present_rect[3] = vh;
+        {   // where the game image is in the window (pixels): the mouse as a finger on the touch screen (hle/input.c) -
+            // reshaped, the interface's centred 16:9 box
+            extern double g_present_rect[4], g_image_rect[4];
+            double bw = wide && os.shape > 1 ? vw / os.shape : vw, bh = wide && os.shape < 1 ? vh * os.shape : vh;
+            g_present_rect[0] = vx + (vw - bw) / 2, g_present_rect[1] = vy + (vh - bh) / 2, g_present_rect[2] = bw, g_present_rect[3] = bh;
+            g_image_rect[0] = vx, g_image_rect[1] = vy, g_image_rect[2] = vw, g_image_rect[3] = vh;  // (the whole image)
         }
         renderer_set_scale((float)sx, (float)sy);
         VkCommandBuffer cb = vk_cmd();
@@ -873,10 +992,54 @@ double vk_display_hz(void) {
         hz = (double)f.QuadPart / (double)ti.qpcRefreshPeriod;
     }
     return hz;
+#elif defined(__ANDROID__)
+    // (the display's current mode, as SDL keeps it: Android tells it when the refresh changes - android_frame_rate)
+    const SDL_DisplayMode *m = window ? SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window)) : NULL;
+    return m && m->refresh_rate > 0 ? m->refresh_rate : 0;
 #else
     return 0;
 #endif
 }
+
+#ifdef __ANDROID__
+#include <android/native_window.h>
+#include <dlfcn.h>
+// The display's refresh for the frame generation's images: Android keeps an app at 60 Hz unless it asks (this phone:
+// 60 / 90 / 120 Hz), and 3x / 4x at 30 fps were drawn and then dropped. Asked for the images' rate - the world's frame
+// rate times the images per frame; Auto: the display's highest - with ANativeWindow_setFrameRate (API 30; the system
+// picks a mode that shows it evenly); frame generation off: the system's choice again. Again for a new window (after
+// the background). Called by vk_frame_begin.
+static void android_frame_rate(void) {
+    typedef int32_t (*SetFrameRate)(ANativeWindow *, float, int8_t);
+    static SetFrameRate set = (SetFrameRate)(void *)1;
+    if (set == (SetFrameRate)(void *)1) {  // (its own library: not found in the default namespace)
+        void *lib = dlopen("libandroid.so", RTLD_NOW);
+        set = lib ? (SetFrameRate)dlsym(lib, "ANativeWindow_setFrameRate") : NULL;
+    }
+    ANativeWindow *w = window ? (ANativeWindow *)SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL) : NULL;
+    if (!set || !w) {
+        static int nlog;
+        if (!nlog++) LOG("[vk] display refresh can't be asked: %s\n", !set ? "no ANativeWindow_setFrameRate" : "no window");
+        return;
+    }
+    float want = 0;
+    if (g_settings.frame_gen == FG_AUTO) {  // (the highest refresh of the display's modes)
+        int n = 0;
+        SDL_DisplayMode **ms = SDL_GetFullscreenDisplayModes(SDL_GetDisplayForWindow(window), &n);
+        for (int i = 0; ms && i < n; i++) if (ms[i]->refresh_rate > want) want = ms[i]->refresh_rate;
+        SDL_free(ms);
+        if (want <= 0) want = 120;
+    } else if (g_settings.frame_gen >= 2) {
+        want = (float)(g_settings.fps > 0 ? g_settings.fps : 30) * (float)g_settings.frame_gen;
+    }
+    static float asked = -1;
+    static ANativeWindow *asked_w;
+    if (want == asked && w == asked_w) return;
+    int32_t r = set(w, want, 1 /* ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE */);
+    LOG("[vk] display refresh asked: %s%.0f Hz (%d)\n", want > 0 ? "" : "the system's choice, ", want, r);
+    asked = want, asked_w = w;
+}
+#endif
 
 static bool vblank_grid(uint64_t *vb, uint64_t *vp) {
 #ifdef _WIN32
@@ -938,7 +1101,7 @@ void backend_present(NvnTexture *t) {
     {   // (LARECOMP_HEAL_KEYS research key F5: every texture re-checks its memory)
         extern volatile int g_heal_tex;
         extern void backend_pool_written(uint64_t addr, uint64_t size);
-        if (g_heal_tex) { g_heal_tex = 0; backend_pool_written(0x7000000000ull, 0x320000000ull); }
+        if (g_heal_tex) { g_heal_tex = 0; backend_pool_written(GUEST_LO, GUEST_HI - GUEST_LO); }
     }
     // (the images of the present before last still waiting: this one's replays write their kept images - exec.c keeps
     // two sets; the last present's can wait for their time)
@@ -1210,12 +1373,31 @@ static void quick_exit_handler(void) {
 #endif
 }
 
+// The game's window when it is not full screen (the launcher's Play, a start without the launcher): the launcher's
+// resolution in pixels, 16:9 - Automatic: the game's own 1280 x 720 -, in the window's coordinates (pixels over its pixel
+// density), smaller with the same shape where the desktop's usable area has no room for it (the render keeps the
+// resolution chosen). LARECOMP_WINDOW (tests) as it says.
+void ui_window_game_size(SDL_Window *win, int *w, int *h) {
+    if (getenv("LARECOMP_WINDOW") && sscanf(getenv("LARECOMP_WINDOW"), "%dx%d", w, h) == 2) return;
+    float ph = g_settings.res_height > 0 ? (float)g_settings.res_height : 720.0f, pw = ph * 16.0f / 9.0f;
+    float pd = SDL_GetWindowPixelDensity(win);
+    if (!(pd > 0)) pd = 1;
+    float fw = pw / pd, fh = ph / pd, k = 1;
+    SDL_Rect usable;
+    if (SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(win), &usable) && usable.w > 0 && usable.h > 0) {
+        // (the height less a title bar's room)
+        k = fminf(1.0f, fminf((float)usable.w / fw, (float)usable.h * 0.94f / fh));
+    }
+    *w = (int)lroundf(fw * k), *h = (int)lroundf(fh * k);
+}
+
 void ui_window_init(void) {
     if (window) return;
     atexit(quick_exit_handler);
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     settings_load();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) FATAL("SDL_Init: %s\n", SDL_GetError());
+    if (!SDL_InitSubSystem(SDL_INIT_SENSOR)) LOG("[input] no sensors: %s\n", SDL_GetError());  // (gyro aiming: hle/input.c)
     input_load_user_mappings();
     int win_w = 1280, win_h = 720;
     if (getenv("LARECOMP_WINDOW")) sscanf(getenv("LARECOMP_WINDOW"), "%dx%d", &win_w, &win_h);
@@ -1224,10 +1406,18 @@ void ui_window_init(void) {
     window = SDL_CreateWindow(RT_APP_NAME, win_w, win_h, wflags);
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
     rt_window_icon(window);
+    if (!getenv("LARECOMP_WINDOW") && !g_settings.fullscreen) {  // (the size the setting asks: ui_window_game_size)
+        ui_window_game_size(window, &win_w, &win_h);
+        SDL_SetWindowSize(window, win_w, win_h);
+        SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    }
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
     if (g_settings.fullscreen && !getenv("LARECOMP_WINDOW") && !getenv("LARECOMP_HIDDEN")) SDL_SetWindowFullscreen(window, true);
     create_instance();
     if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
+#ifdef __ANDROID__
+    SDL_AddEventWatch(lifecycle_watch, NULL);
+#endif
     pick_device();
     create_device();
     create_swapchain();
@@ -1259,13 +1449,25 @@ void backend_clear_window(void) {
     if (g_vk.dev && vk_frame_begin(black)) vk_frame_end(NULL);
 }
 
+// The next window / input event, or false after a short wait with none. (Android: SDL_WaitEventTimeout polls there
+// without sleeping - one core at 100% for the whole game, the phone hot and throttled - so poll and sleep 4 ms.)
+static bool next_event(SDL_Event *e) {
+#ifdef __ANDROID__
+    if (SDL_PollEvent(e)) return true;
+    SDL_Delay(4);
+    return false;
+#else
+    return SDL_WaitEventTimeout(e, 16);
+#endif
+}
+
 int ui_run(void) {
     ui_window_init();
     atomic_store(&ui_ready, true);
     for (;;) {
         if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
         SDL_Event e;
-        while (SDL_WaitEventTimeout(&e, 16)) {
+        while (next_event(&e)) {
             if (e.type == SDL_EVENT_QUIT) {
                 LOG("window closed\n");
                 exit(0);
@@ -1274,6 +1476,8 @@ int ui_run(void) {
             if (menu_handle_event(&e)) continue;
             input_handle_event(&e);
         }
+        extern void input_poll(void);
+        input_poll();  // (gyro aiming: its sensor on while the game aims)
         menu_apply_window_requests(window);
     }
 }

@@ -116,7 +116,7 @@ uint64_t fps60_timers(void) { return g_timers; }  // (runtime/hle/fps60_research
 
 // G[1] at 60 Hz for the duration of f: the world's step; any other scene keeps the game's value.
 static int accessor_hook(Cpu *c, uint64_t addr) {
-    volatile uint32_t *g1 = (volatile uint32_t *)(uintptr_t)G1_ADDR;
+    volatile uint32_t *g1 = (volatile uint32_t *)(uintptr_t)GA(G1_ADDR);
     g_n_acc++;
     g_timers = c->x[0];
     if (!g_on || !g_world) return 0;
@@ -127,7 +127,7 @@ static int accessor_hook(Cpu *c, uint64_t addr) {
 }
 
 static int g1_reader_hook(Cpu *c, uint64_t addr) {
-    volatile uint32_t *g1 = (volatile uint32_t *)(uintptr_t)G1_ADDR;
+    volatile uint32_t *g1 = (volatile uint32_t *)(uintptr_t)GA(G1_ADDR);
     *g1 = G1_60HZ;
     rt_call_original(c, addr);
     *g1 = G1_ORIGINAL;
@@ -141,13 +141,13 @@ static void log_index(void) {
     uint64_t f = renderer_game_frame();
     if (f - last < 60) return;
     last = f;
-    const uint64_t *slot = (const uint64_t *)(uintptr_t)(0x7000000000ull + 0x15fab08);
+    const uint64_t *slot = (const uint64_t *)(uintptr_t)GA(0x7000000000ull + 0x15fab08);
     const uint64_t *obj = (const uint64_t *)(uintptr_t)*slot;
-    if (!obj || (uint64_t)(uintptr_t)obj < 0x7000000000ull) return;
+    if (!obj || (uint64_t)(uintptr_t)obj < GUEST_LO) return;
     const uint64_t *real = (const uint64_t *)(uintptr_t)*obj;
-    if (!real || (uint64_t)(uintptr_t)real < 0x7000000000ull) return;
+    if (!real || (uint64_t)(uintptr_t)real < GUEST_LO) return;
     LOG("[fps60] present %llu: frame-rate index %d (G[idx] = %u)\n", (unsigned long long)f, *(const int32_t *)((const uint8_t *)real + 0x88),
-        *(const uint32_t *)(uintptr_t)(0x7000f7eeb8ull + 8ull * (uint32_t)*(const int32_t *)((const uint8_t *)real + 0x88)));
+        *(const uint32_t *)(uintptr_t)(GA(0x7000f7eeb8ull) + 8ull * (uint32_t)*(const int32_t *)((const uint8_t *)real + 0x88)));
 }
 
 bool fps60_enabled(void) { return g_on; }
@@ -182,7 +182,7 @@ static __thread bool t_in_move;
 static __thread float t_move_k;
 static int move_hook(Cpu *c, uint64_t addr) {
     float k = g_on && g_world ? (float)g_g1 / (float)G1_ORIGINAL : 1.0f;
-    if (k >= 0.999f || c->x[0] < 0x7000000000ull) return 0;  // (the game's own step: as it is)
+    if (k >= 0.999f || c->x[0] < GUEST_LO) return 0;  // (the game's own step: as it is)
     float *p = (float *)(uintptr_t)(c->x[0] + 0x70), was[3] = {p[0], p[1], p[2]};
     for (int i = 0; i < 3; i++) p[i] = was[i] * k;
     t_in_move = true, t_move_k = k;
@@ -244,7 +244,7 @@ void fps60_present(void) {
         if (!t0) t0 = now, p0 = p;
         if (now - t0 >= 1000000000ull) {
             LOG("[stats] t+%.2fs presents %llu world %lu acc %lu tick_ask %lu tick_do %lu scene %d interval %d G1 %u\n", (now - t0) / 1e9,
-                (unsigned long long)(p - p0), g_n_world, g_n_acc, g_n_tick_ask, g_n_tick_do, g_scene, rt_present_interval(), *(volatile uint32_t *)(uintptr_t)G1_ADDR);
+                (unsigned long long)(p - p0), g_n_world, g_n_acc, g_n_tick_ask, g_n_tick_do, g_scene, rt_present_interval(), *(volatile uint32_t *)(uintptr_t)GA(G1_ADDR));
             t0 = now, p0 = p, g_n_world = g_n_acc = g_n_tick_ask = g_n_tick_do = 0;
         }
     }

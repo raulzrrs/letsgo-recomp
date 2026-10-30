@@ -253,10 +253,15 @@ static int font_cache_k(const NvnTexture *t) {
 }
 
 // The glyph caches' scale (runtime/hle/font_hires.c): one step per 720 lines of the window, up to 4 (1: off).
+// Android: always 1.
 int renderer_font_scale(void) {
+#ifdef __ANDROID__
+    return 1;  // (phones: the game's own glyphs - no second rasterization, no 4x larger cache textures)
+#else
     uint32_t h = g_vk.sc_extent.height;
     int k = (int)((h + 719) / 720);
     return k < 1 ? 1 : k > 4 ? 4 : k;
+#endif
 }
 
 static void create_image(NvnTexture *t, TexBackend *b) {
@@ -372,6 +377,8 @@ static uint32_t level_w(const TexBackend *b, uint32_t lv) { uint32_t v = b->widt
 static uint32_t level_h(const TexBackend *b, uint32_t lv) { uint32_t v = b->height >> lv; return v ? v : 1; }
 
 static void destroy_image(TexBackend *b) {
+    extern void vk_pclear_forget(TexBackend *b);  // (exec.c: a clear still pending on it)
+    vk_pclear_forget(b);
     views_forget(b);
     if (b->image || b->mem) defer((Dead){.img = b->image, .mem = b->mem});  // (never the same allocation twice)
     b->image = VK_NULL_HANDLE;

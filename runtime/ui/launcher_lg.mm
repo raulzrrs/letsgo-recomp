@@ -34,6 +34,7 @@ extern "C" {
 void settings_save(void);
 void ui_window_init(void);
 SDL_Window *ui_window(void);
+void ui_window_game_size(SDL_Window *win, int *w, int *h);
 void menu_apply_window_requests(void *sdl_window);
 bool vk_frame_begin(const float clear[4]);
 void vk_frame_end(const char *shot_path);
@@ -378,20 +379,18 @@ static void mods_section(SDL_Window *win, int inst) {
 // ------------------------------------------------------------------ the launcher's window
 // A launcher's own window while the start screen is up: no system frame (dragged by its top strip; its own minimize and
 // close buttons), taller than wide, in the middle of the screen. Play gives the game its window back: the frame, the
-// size it had (1280 x 720, or LARECOMP_WINDOW) and full screen when that setting is on.
+// size of the resolution chosen (Automatic: the game's 1280 x 720; device.c ui_window_game_size) and full screen when
+// that setting is on.
 static float g_drag_h, g_buttons_w;  // (logical pixels: the strip that drags the window, the buttons at its right end)
 static SDL_HitTestResult SDLCALL launcher_hit(SDL_Window *win, const SDL_Point *pt, void *) {
     int w = 0, h = 0;
     SDL_GetWindowSize(win, &w, &h);
     return pt->y < g_drag_h && pt->x < w - g_buttons_w ? SDL_HITTEST_DRAGGABLE : SDL_HITTEST_NORMAL;
 }
-static int g_game_w = 1280, g_game_h = 720;
 static void window_as_launcher(SDL_Window *win) {
-    int w, h;
-    SDL_GetWindowSize(win, &w, &h);
-    if (!(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) && w > 0 && h > 0 && !getenv("LARECOMP_LAUNCHER_SHOT")) g_game_w = w, g_game_h = h;
-    if (getenv("LARECOMP_WINDOW")) sscanf(getenv("LARECOMP_WINDOW"), "%dx%d", &g_game_w, &g_game_h);
+#ifndef __ANDROID__  // (a phone has no window: always the whole screen)
     SDL_SetWindowFullscreen(win, false);
+#endif
     SDL_Rect usable = {0, 0, 1920, 1040};
     SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(win), &usable);
     int lh = usable.h * 86 / 100 < 900 ? usable.h * 86 / 100 : 900, lw = lh * 86 / 100;
@@ -405,7 +404,9 @@ static void window_as_game(SDL_Window *win) {
     SDL_SetWindowHitTest(win, NULL, NULL);
     SDL_SetWindowBordered(win, true);
     SDL_SetWindowResizable(win, true);
-    SDL_SetWindowSize(win, g_game_w, g_game_h);
+    int gw, gh;
+    ui_window_game_size(win, &gw, &gh);
+    SDL_SetWindowSize(win, gw, gh);
     SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     if (g_settings.fullscreen && !getenv("LARECOMP_WINDOW") && !getenv("LARECOMP_HIDDEN")) SDL_SetWindowFullscreen(win, true);
     // black at the new size until the game draws (else the launcher's last image stayed in a corner while it loads);
@@ -483,7 +484,8 @@ extern "C" void launcher_lg_run(const char *root) {
     int res = 0;
     for (int i = 0; i < 5; i++) if (res_lines[i] == g_settings.res_height) res = i;
     bool ui2x_on = g_settings.ui2x;  // (the interface at 2x: runtime/ui2x.c)
-    bool full = g_settings.fullscreen, wildb = g_settings.wild_battle, skipc = g_settings.skip_controller;
+    bool full = g_settings.fullscreen, wildb = g_settings.wild_battle, skipc = g_settings.skip_controller, uwide = g_settings.ultrawide,
+         gyro = g_settings.gyro_aim;
     mods_reload(g_settings.mod);  // (the folders under mods/: runtime/mods.h)
     long shot_at = getenv("LARECOMP_LAUNCHER_SHOT") ? atol(getenv("LARECOMP_LAUNCHER_SHOT")) : 0, frame = 0;
     bool autoplay = getenv("LARECOMP_LAUNCHER_AUTOPLAY") != NULL, play = false;
@@ -545,8 +547,14 @@ extern "C" void launcher_lg_run(const char *root) {
         }
         ImGui_ImplVulkan_NewFrame();
         ImGui_ImplSDL3_NewFrame();
-        // (the launcher is narrow: its fonts a little smaller than the F12 menu's at the same height)
-        g_scale = ui_scale(scaler, io.DisplaySize.y * 0.86f);
+        // (the launcher is narrow: its fonts a little smaller than the F12 menu's at the same height; on a phone's dense
+        // screen, twice as large)
+#ifdef __ANDROID__
+        const float zoom = 2.0f;
+#else
+        const float zoom = 1.0f;
+#endif
+        g_scale = ui_scale(scaler, io.DisplaySize.y * 0.86f * zoom);
         ImGui::NewFrame();
         float s = g_scale;
         bool known = !setup_ready() || game_build("extracted/exefs") != GAME_BUILD_OTHER;
@@ -634,6 +642,7 @@ extern "C" void launcher_lg_run(const char *root) {
                           ImGuiWindowFlags_NoScrollbar);
         {
             ui_title(fonts.title, names[tab]);
+#ifndef __ANDROID__  // (a phone has no window to minimise or close: the system's own buttons)
             {   // the window's buttons in its top right corner, side by side on one line (placed, not flowed after the title)
                 ImVec2 back = ImGui::GetCursorScreenPos(), wp = ImGui::GetWindowPos();
                 float bsz = 40 * s, gap = 6 * s, x = wp.x + ImGui::GetWindowWidth() - cpad - bsz * 2 - gap, y = wp.y + pad * 0.6f;
@@ -643,6 +652,7 @@ extern "C" void launcher_lg_run(const char *root) {
                 if (window_button("##close", true, bsz)) exit(0);
                 ImGui::SetCursorScreenPos(back);
             }
+#endif
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 16 * s - ImGui::GetStyle().ItemSpacing.y);  // (16 px to the page)
             ui_page_begin("##page", ImVec2(0, 0));
             if (tab == TAB_GAME) {
@@ -650,8 +660,9 @@ extern "C" void launcher_lg_run(const char *root) {
                 ui_heading(T("Options", "Opções"));
                 // A / B and X / Y by the layout's positions (runtime/hle/bindings.c bind_set_layout)
                 const char *ol[] = {T("Wild battles (experimental)", "Batalhas selvagens (experimental)"),
-                                    T("Skip controller selection", "Pular a escolha do controle"), T("Controller layout", "Layout do controle")};
-                float ox = ui_label_x(ol, 3);
+                                    T("Skip controller selection", "Pular a escolha do controle"), T("Controller layout", "Layout do controle"),
+                                    T("Gyro aiming", "Mirar com giroscópio")};
+                float ox = ui_label_x(ol, 4);
                 ImGui::BeginDisabled(!known);
                 ui_toggle("##wild", ol[0], ox, &wildb);
                 ui_tip(!known ? only : T("Touching a wild Pokémon starts a classic battle instead of going straight to the capture. "
@@ -666,15 +677,22 @@ extern "C" void launcher_lg_run(const char *root) {
                 int lv = bind_layout();
                 ui_row(ol[2], ox);
                 if (ui_combo("##padlayout", &lv, lay, 2)) bind_set_layout(lv);
+                ui_toggle("##gyro", ol[3], ox, &gyro);
+                ui_tip(T("Aiming a Poké Ball turns with the controller's gyroscope (DualSense, DualShock 4, Switch Pro, Joy-Con) or, without one, the phone's or tablet's - as in handheld mode on the Switch. The stick and the mouse still aim.",
+                         "Ao mirar uma Poké Ball, a mira gira com o giroscópio do controle (DualSense, DualShock 4, Switch Pro, Joy-Con) ou, sem ele, o do celular ou tablet - como no modo portátil do Switch. O analógico e o mouse continuam mirando."));
                 ui_tip(T("Which controller buttons are A / B and X / Y. Nintendo: A right, B bottom. Xbox: A bottom, B right, as the letters on an Xbox controller. The button prompts follow.",
                          "Quais botões do controle são A / B e X / Y. Nintendo: A à direita, B embaixo. Xbox: A embaixo, B à direita, como as letras de um controle de Xbox. Os ícones dos botões acompanham."));
             } else if (tab == TAB_GRAPHICS) {
-                const char *extra[] = {T("Resolution", "Resolução"), T("Fullscreen", "Tela cheia")};
-                float x = ui_graphics_x(extra, 2);
+                const char *extra[] = {T("Resolution", "Resolução"), T("Fullscreen", "Tela cheia"),
+                                       T("Ultrawide support (experimental)", "Suporte ultrawide (experimental)")};
+                float x = ui_graphics_x(extra, 3);
                 ui_row(extra[0], x);
                 ui_combo("##res", &res, g_pt ? res_pt : res_en, 5);
                 ui_toggle("##full", extra[1], x, &full);
                 ui_tip(T("When the game starts.", "Ao começar o jogo."));
+                ui_toggle("##ultrawide", extra[2], x, &uwide);
+                ui_tip(T("A screen wider than 16:9 is filled with the game's image instead of black bars at its sides; the interface stays in a centred 16:9 box.",
+                         "Uma tela mais larga que 16:9 é preenchida com a imagem do jogo em vez de faixas pretas nas laterais; a interface fica numa área 16:9 centralizada."));
                 ui_group_gap();
                 ui_page_graphics(x, known);
                 ui2x_section(ready, &ui2x_on);
@@ -704,6 +722,8 @@ extern "C" void launcher_lg_run(const char *root) {
     settings_apply_levels();  // (the upscaler follows the anti-aliasing)
     g_settings.wild_battle = wildb;
     g_settings.skip_controller = skipc;
+    g_settings.gyro_aim = gyro;
+    g_settings.ultrawide = uwide;
     g_settings.ui2x = ui2x_on;
     mods_active(g_settings.mod, sizeof g_settings.mod);
     settings_save();

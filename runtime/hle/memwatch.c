@@ -102,13 +102,13 @@ static bool known_pair(uint16_t sp, uint8_t lv) {
 }
 
 static void find_party(void) {
-    uint64_t a = 0x7000000000ull;
+    uint64_t a = GUEST_LO;
     int found = 0;
-    while (a < 0x7800000000ull) {
+    while (a < GUEST_HI) {
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi)) break;
         uint64_t base = (uint64_t)(uintptr_t)mbi.BaseAddress, size = mbi.RegionSize;
-        if (mbi.State == MEM_COMMIT && (mbi.Protect == PAGE_READWRITE) && size >= 0x104 && base >= 0x7200000000ull) {  // (the heaps: the modules' data tables only look like Pokémon)
+        if (mbi.State == MEM_COMMIT && (mbi.Protect == PAGE_READWRITE) && size >= 0x104 && base >= GA(0x7200000000ull)) {  // (the heaps: the modules' data tables only look like Pokémon)
             const uint8_t *b = (const uint8_t *)(uintptr_t)base;
             for (size_t o = 0; o + 0x104 <= size; o += 4) {
                 uint16_t sp = *(const uint16_t *)(b + o + 8);
@@ -146,8 +146,8 @@ static size_t g_npages, g_cappages;
 
 static void snap_take(void) {
     static const uint8_t zero[4096];
-    uint64_t a = 0x7200000000ull, bytes = 0;
-    while (a < 0x7800000000ull) {
+    uint64_t a = GA(0x7200000000ull), bytes = 0;
+    while (a < GUEST_HI) {
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi)) break;
         uint64_t base = (uint64_t)(uintptr_t)mbi.BaseAddress, size = mbi.RegionSize;
@@ -230,7 +230,7 @@ void memwatch_present(void) {
     uint64_t src = strchr(e, ':') ? strtoull(strchr(e, ':') + 1, NULL, 16) : 0;
     uint32_t v = *(volatile uint32_t *)(uintptr_t)src;
     int found = 0;
-    for (uint64_t a = 0x7200000000ull; a < 0x7800000000ull;) {
+    for (uint64_t a = GA(0x7200000000ull); a < GUEST_HI;) {
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi)) break;
         uint64_t base = (uint64_t)(uintptr_t)mbi.BaseAddress, size = mbi.RegionSize;

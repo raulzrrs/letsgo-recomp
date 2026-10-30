@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+- **Android: the display's refresh follows the frame generation** (the world's fps x its images per frame; Auto: the
+  display's highest), asked with `ANativeWindow_setFrameRate` - left at 60 Hz, 3x / 4x images were drawn and dropped.
+  A warm phone may still cap it at 60 Hz (thermal policy).
+
+- **The upscalers in one setting** (F12 Graphics and the start screen, *Upscaler*; `upscaler =` in larecomp.ini):
+  Bilinear (the default), Snapdragon GSR 2, FSR 3.1, and on Android Snapdragon GSR. Anti-aliasing is Off / SMAA / TAA, set
+  aside (its row disabled) while a temporal upscaler - FSR 3.1, GSR 2 - smooths the edges itself; the choice is kept
+  for when the upscaler changes. FSR 3.1 was an anti-aliasing choice: an older file's `aa = fsr3` reads as the
+  upscaler, and an older version reads the new file's `upscaler = fsr3` as FSR 3.1 too.
+- **Upscaler: Snapdragon GSR** (Android; `upscaler = gsr`, with any anti-aliasing): Qualcomm's Game Super Resolution 1 (BSD 3-Clause, third_party/snapdragon-gsr) brings a render
+  resolution below the window's up to it in the present's own draw - a 12-tap Lanczos-like filter with adaptive
+  sharpening at edges - instead of bilinear. ~0.3 ms a frame at 2133x1200 on an Adreno 830.
+- **Android: FSR 3.1** - AMD's FidelityFX SDK 1.1.4 (MIT) built from its sources for arm64 (`make ffx-android`,
+  tools/build_ffx_android.sh: its upscaler, the Vulkan backend and the passes' SPIR-V, made with the SDK's own shader
+  tools) and linked in; on Android it had fallen back to FSR 1. On an Adreno 830 at 2133x1200, Performance (1067x600):
+  ~4 - 5 ms of the GPU's frame (the frame 22.3 ms against 18.1 with SMAA at the same render size). Its 16-bit shader
+  variants are now allowed (`shaderFloat16` enabled where the GPU has it). A profiled frame (`LARECOMP_GPUPROF_AT`) has
+  a row for each FSR 3.1 pass.
+- **Upscaler: Snapdragon GSR 2** (`upscaler = gsr2`, PC and Android): Qualcomm's Game Super Resolution 2
+  (BSD 3-Clause, its 2-pass fragment variant), temporal like FSR 3.1 and with its modes (Native AA to Ultra
+  Performance), the same jitter, motion vectors, interface mask and sharpening slider (our RCAS, in one pass with the
+  interface). Lighter on phones: on the Adreno 830 at 2133x1200, Performance, ~3.4 ms (motion 0.56, upscale 1.45 in
+  half precision as Qualcomm's, sharpening and interface 1.36) and no library. With frame generation its in-between
+  images are resolved against N's output, as FSR 3.1's.
+- **Balanced (1.7x) as sharp as the other modes**: with a temporal upscaler (FSR 3.1, GSR 2) the render scale is
+  now one that makes the game's 1920x1080 whole pixels, a multiple of 4 on each side (4K Balanced: 2240x1260, 1.71x).
+  At 1 / 1.7 the game drew 2258.8 x 1270.6 into a 2259 x 1271 image, a stretch the upscaler did not know of, and its
+  history blurred: at 4K ~63 - 76% of Native AA's detail in still scenes, now ~97 - 100% as Quality and Performance.
+- **Crash reports list the faulting thread's stack**: the words on it that point into a loaded module (a crash inside
+  a driver or an injected dll now shows who called).
+- **The colour grade in the present** (brightness / contrast / saturation, F12 Image) when nothing comes after it: one
+  full-size pass less. **Android: no debanding** by default (~12% of a phone's GPU frame at 1080p; `LARECOMP_DEBAND=1`).
+
 ## 0.7.5 (2026-10-25)
 
 - **Fix: at 60 fps, the wild battle that comes back after a ball breaks ran as a menu** - at 60 with in-between
@@ -496,7 +531,7 @@ screen.
     `aa = fsr3`; an older `upscaler = fsr3` reads as it.
   - **Frame generation**: Off / 2x, with FSR 3.1 anti-aliasing, switched live (AMD's swapchain is made or dropped at the
     next frame; its queues are now created with the device whenever the DLL is there). FSR 3.1 generates one frame
-    between two (several is FSR 4's, DirectX 12 only). `frame_gen = 2`.
+    between two. `frame_gen = 2`.
   - **SSAO and GI**: quality levels Off (default) / Low / Medium / High instead of a box, and their parameters are gone
     from the advanced page (its debug views stay, under Debug). High is what they had before. SSAO: 16 / 12 / 8 samples
     (the shader takes the count now). GI: 4 rays x 8 steps at half the scene's size / 3 x 6 at half / 2 x 6 at a third.
@@ -622,8 +657,7 @@ screen.
   it). Frame-to-frame instability walking 10-17% lower than without; no trail behind the player.
 - **FSR 3.1** (F12, *Upscaler*: Bilinear / FSR 1 / FSR 3.1), when the render resolution is below the window's: AMD
   FidelityFX SDK 1.1.4 through its C API and AMD's signed `amd_fidelityfx_vk.dll` (MIT; shipped next to the exe,
-  loaded at run time - without it, FSR 1). The newest FSR with a Vulkan backend: the FSR SDK 2.x (FSR 4) is DirectX 12
-  only. The scene is jittered with FSR's own sequence; FSR gets the game image, the scene depth, the motion vectors
+  loaded at run time - without it, FSR 1). The newest FSR with a Vulkan backend. The scene is jittered with FSR's own sequence; FSR gets the game image, the scene depth, the motion vectors
   (camera + per object) and a mask of the interface (the pixels that changed after the frame's first interface draw).
   From 640x360 to 1280x720 it is visibly cleaner than FSR 1 (difference to native 5.14 vs 5.40). The backend asks for
   debug-utils and AMD marker functions this device lacks: they get no-ops; `...KHR` names fall back to Vulkan 1.1 core.

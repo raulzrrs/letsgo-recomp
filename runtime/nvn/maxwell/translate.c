@@ -3,7 +3,8 @@
 // The binary is an NVN header (0x30), the shader program header (SPH, 0x50; graphics stages), then
 // instructions in groups of four 64-bit words (one scheduling word + three instructions).
 // Registers are emitted as `uint` variables; float ops use as_type<> conversions. Shaders with
-// branches become a `switch (pc)` state machine with explicit SSY/PBK/PCNT stacks.
+// branches become a `switch (pc)` state machine with explicit SSY/PBK/PCNT stacks - in GLSL only those with loops or
+// branches back: forward-only ones are straight code with jump flags (straight_ok; Android by default).
 //
 // GLSL: the instruction body is generated in the MSL spelling and converted by glsl_rewrite() (a token-aware
 // pass: as_type<T>() -> as_u/as_f overloads, float4 -> vec4, ulong -> uint64_t, char()/short() casts -> sx8/sx16,
@@ -28,6 +29,9 @@
 #include "shader.h"
 
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
+// > 0: global memory in chunks of 1 << maxwell_gmem_chunk_shift bytes, each its own GPU allocation reached through its
+// device address (Android: runtime/nvn/vulkan/exec.c renderer_share_heap); 0: one buffer.
+int maxwell_gmem_chunk_shift;
 const uint8_t *maxwell_dbg_code;
 uint32_t maxwell_dbg_pc;
 int maxwell_dbg_reg;
@@ -84,6 +88,8 @@ typedef struct {
     bool glsl;               // emit Vulkan GLSL: dialect-specific constructs here, the rest via glsl_rewrite()
     bool uses_gmem_store;    // STG present: the gmem buffer is not readonly
     uint32_t cbuf_need[18];  // highest constant vec4 index + 1 per cbuf (array size of the GLSL block)
+    bool straight;           // GLSL, forward branches only: straight code with jump flags, not the pc state machine
+    uint32_t sync_target;    // (straight) where the SYNC being translated goes: the innermost SSY's target
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
@@ -835,6 +841,58 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
     write_tex_result(c, slot, call, mask, d, RZ, false, false);
 }
 
+// Straight GLSL for programs whose branches all go forward (the game's: if / else with SSY ... SYNC, no loops): the
+// code in program order, each stretch between branch targets in an `if (live)`; a branch or SYNC sets its target's flag
+// (jl<pc>) and turns `live` off, a target turns it on again when its flag is set. The pc state machine (a loop around a
+// switch) kept every register live across the whole shader: on Adreno the world's materials used ~27 registers and
+// ran at 9% occupancy. Not for loops (PBK / PCNT / BRK / CONT), indexed branches (BRX) or branches back; each SSY's
+// target must close what it opened in program order (a SYNC, branch or EXIT just before it) - the SYNCs' targets are
+// then known here. Android only by default (on PC the GLSL - and so the players' SPIR-V caches - stays as it was);
+// LARECOMP_VK_STRAIGHT=1 / 0 turns it on / off anywhere.
+static bool straight_on(void) {
+    static int on = -1;
+#ifdef __ANDROID__
+    if (on < 0) on = !getenv("LARECOMP_VK_STRAIGHT") || atoi(getenv("LARECOMP_VK_STRAIGHT")) != 0;
+#else
+    if (on < 0) on = getenv("LARECOMP_VK_STRAIGHT") && atoi(getenv("LARECOMP_VK_STRAIGHT")) != 0;
+#endif
+    return on;
+}
+static bool straight_ok(const uint64_t *code, size_t end) {
+    if (!straight_on()) return false;
+    uint32_t stack[16];
+    int n = 0;
+    uint64_t prev = 0;
+    for (size_t i = 0; i < end; i++) {
+        if (i % 4 == 0) continue;
+        uint64_t w = code[i];
+        uint32_t pc = (uint32_t)(i * 8);
+        bool closes = false;
+        while (n && stack[n - 1] == pc) n--, closes = true;
+        if (closes) {  // (only an unpredicated SYNC, branch or EXIT may come before an SSY's target)
+            uint64_t op = prev & 0xfff0000000000000ull;
+            bool guarded = ((prev >> 16) & 0xf) != 7;
+            if (guarded || (op != 0xf0f0000000000000ull && op != 0xe240000000000000ull && op != 0xe300000000000000ull) ||
+                (op == 0xf0f0000000000000ull && (prev & 0xfff8000000000000ull) != 0xf0f8000000000000ull))
+                return false;
+        }
+        uint64_t top12 = w & 0xfff0000000000000ull;
+        if (((top12 == 0xe240000000000000ull || top12 == 0xe290000000000000ull) && (w & 0x20)) || top12 == 0xe250000000000000ull || top12 == 0xe2a0000000000000ull || top12 == 0xe2b0000000000000ull ||
+            top12 == 0xe340000000000000ull || top12 == 0xe350000000000000ull)
+            return false;  // BRA / SSY in another form, BRX, PBK, PCNT, BRK, CONT
+        int64_t t = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
+        bool flow = (w & 0xfff0000000000020ull) == 0xe240000000000000ull || (w & 0xfff0000000000020ull) == 0xe290000000000000ull;
+        if (flow && t != pc && (t < pc || (size_t)(t / 8) >= end)) return false;  // back, or past the end (no flag for it)
+        if ((w & 0xfff0000000000020ull) == 0xe290000000000000ull) {  // SSY
+            if (t <= pc || n == 16) return false;
+            stack[n++] = (uint32_t)t;
+        }
+        if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull && !n) return false;  // SYNC without SSY
+        prev = w;
+    }
+    return n == 0;
+}
+
 // ------------------------------------------------------------------ instruction translation
 static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     char t[2048], u[2048];
@@ -856,7 +914,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
 
 #define OPM(val, mask) ((w & (uint64_t)(mask)) == (uint64_t)(val))
     if (OPM(0xe300000000000000ull, 0xfff0000000000000ull)) {  // EXIT
-        sp(&c->body, c->branchy ? "    exit_now = true; break;\n" : "    break;\n");
+        sp(&c->body, c->straight ? "    live = false;\n" : c->branchy ? "    exit_now = true; break;\n" : "    break;\n");
     } else if (OPM(0xe330000000000000ull, 0xfff0000000000000ull)) {  // KIL
         c->info->uses_discard = true;
         if (getenv("LARECOMP_NO_DISCARD")) {
@@ -866,10 +924,12 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0xe240000000000000ull, 0xfff0000000000020ull)) {  // BRA
         uint32_t target = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
         c->uses_branches = true;
-        sp(&c->body, "    pc = %uu; continue;\n", target);
+        if (c->straight && target > pc) sp(&c->body, "    jl%u = true; live = false;\n", target);
+        else if (c->straight) sp(&c->body, "    live = false;\n");  // (the branch to itself after the last EXIT)
+        else sp(&c->body, "    pc = %uu; continue;\n", target);
     } else if (OPM(0xe290000000000000ull, 0xfff0000000000020ull)) {  // SSY
         c->uses_branches = true;
-        sp(&c->body, "    ssy[ssy_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
+        if (!c->straight) sp(&c->body, "    ssy[ssy_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xe2a0000000000000ull, 0xfff0000000000020ull)) {  // PBK
         c->uses_branches = true;
         sp(&c->body, "    pbk[pbk_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
@@ -877,7 +937,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         c->uses_branches = true;
         sp(&c->body, "    pcnt[pcnt_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xf0f8000000000000ull, 0xfff8000000000000ull)) {  // SYNC
-        sp(&c->body, "    pc = ssy[--ssy_n]; continue;\n");
+        if (c->straight) sp(&c->body, "    jl%u = true; live = false;\n", c->sync_target);
+        else sp(&c->body, "    pc = ssy[--ssy_n]; continue;\n");
     } else if (OPM(0xe340000000000000ull, 0xfff0000000000000ull)) {  // BRK
         sp(&c->body, "    pc = pbk[--pbk_n]; continue;\n");
     } else if (OPM(0xe350000000000000ull, 0xfff0000000000000ull)) {  // CONT
@@ -1473,31 +1534,38 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                                                "uint(*(device ushort *)(gmem + ga))", "uint(int(*(device short *)(gmem + ga)))"};
         int nw = size == 5 ? 2 : size >= 6 ? 4 : 1;
         if (c->glsl) {  // gmem_.w[]: 32-bit words; sub-word accesses within the containing word
+            // (chunked: GW(word index), defined with the buffer in glsl_finish)
+            const char *wo = maxwell_gmem_chunk_shift ? "GW(" : "gmem_.w[", *wc = maxwell_gmem_chunk_shift ? ")" : "]";
             static const char *const gl_small[] = {
-                "(gmem_.w[uint(ga >> 2)] >> (uint(ga & 3ul) * 8u)) & 0xFFu",
-                "uint(sx8(gmem_.w[uint(ga >> 2)] >> (uint(ga & 3ul) * 8u)))",
-                "(gmem_.w[uint(ga >> 2)] >> (uint(ga & 2ul) * 8u)) & 0xFFFFu",
-                "uint(sx16(gmem_.w[uint(ga >> 2)] >> (uint(ga & 2ul) * 8u)))"};
+                "(%suint(ga >> 2)%s >> (uint(ga & 3ul) * 8u)) & 0xFFu",
+                "uint(sx8(%suint(ga >> 2)%s >> (uint(ga & 3ul) * 8u)))",
+                "(%suint(ga >> 2)%s >> (uint(ga & 2ul) * 8u)) & 0xFFFFu",
+                "uint(sx16(%suint(ga >> 2)%s >> (uint(ga & 2ul) * 8u)))"};
             if (!store) {
                 if (size < 4) {
-                    if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      if (ok) r%d = %s; else r%d = 0u;\n", d, gl_small[size], d); }
+                    if (d != RZ) {
+                        c->reg_used[d] = 1;
+                        sp(&c->body, "      if (ok) r%d = ", d);
+                        sp(&c->body, gl_small[size], wo, wc);
+                        sp(&c->body, "; else r%d = 0u;\n", d);
+                    }
                 } else {
                     for (int k = 0; k < nw; k++)
                         if (d != RZ && d + k < RZ) {
                             c->reg_used[d + k] = 1;
-                            sp(&c->body, "      if (ok) r%d = gmem_.w[uint(ga >> 2) + %du]; else r%d = 0u;\n", d + k, k, d + k);
+                            sp(&c->body, "      if (ok) r%d = %suint(ga >> 2) + %du%s; else r%d = 0u;\n", d + k, wo, k, wc, d + k);
                         }
                 }
             } else {
                 c->uses_gmem_store = true;
                 c->info->gmem_stores = true;
                 if (size < 4)
-                    sp(&c->body, "      if (ok) { uint wi = uint(ga >> 2); uint sh = uint(ga & %s) * 8u; atomicAnd(gmem_.w[wi], ~(0x%xu << sh)); "
-                       "atomicOr(gmem_.w[wi], (%s & 0x%xu) << sh); }\n", size < 2 ? "3ul" : "2ul", size < 2 ? 0xFFu : 0xFFFFu, R(d),
-                       size < 2 ? 0xFFu : 0xFFFFu);
+                    sp(&c->body, "      if (ok) { uint wi = uint(ga >> 2); uint sh = uint(ga & %s) * 8u; atomicAnd(%swi%s, ~(0x%xu << sh)); "
+                       "atomicOr(%swi%s, (%s & 0x%xu) << sh); }\n", size < 2 ? "3ul" : "2ul", wo, wc, size < 2 ? 0xFFu : 0xFFFFu, wo, wc,
+                       R(d), size < 2 ? 0xFFu : 0xFFFFu);
                 else
                     for (int k = 0; k < nw; k++)
-                        sp(&c->body, "      if (ok) gmem_.w[uint(ga >> 2) + %du] = %s;\n", k, R(d == RZ ? RZ : d + k));
+                        sp(&c->body, "      if (ok) %suint(ga >> 2) + %du%s = %s;\n", wo, k, wc, R(d == RZ ? RZ : d + k));
             }
         } else if (!store) {
             if (size < 4) {
@@ -1578,7 +1646,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (c->stage == STAGE_VERTEX) {
             set_reg(c, d, R(a));  // no SIMD-group functions in vertex functions: lane-local value
         } else if (c->glsl) {  // a quad xor (lane mask < 4) is the subgroup xor within the quad
-            static const char *const fn[] = {"subgroupShuffle", "subgroupShuffleUp", "subgroupShuffleDown", "subgroupShuffleXor"};
+            // (shfl_*: Maxwell's 32-lane warp inside a subgroup that may be wider - 64 on Adreno, AMD's wave64)
+            static const char *const fn[] = {"shfl_idx", "shfl_up", "shfl_down", "shfl_xor"};
             sprintf(t, "%s(%s, uint(%s))", fn[mode], R(a), bv);
             set_reg(c, d, t);
         } else if (mode == 3) {
@@ -1672,7 +1741,7 @@ static void glsl_rewrite(Ctx *c, Str *o, const char *src) {
         {"float2", "vec2"}, {"float3", "vec3"}, {"float4", "vec4"}, {"int2", "ivec2"}, {"int3", "ivec3"},
         {"int4", "ivec4"}, {"uint2", "uvec2"}, {"uint3", "uvec3"}, {"uint4", "uvec4"}, {"bool2", "bvec2"},
         {"ulong", "uint64_t"}, {"long", "int64_t"}, {"rsqrt", "inversesqrt"}, {"rint", "roundEven"},
-        {"front_facing", "gl_FrontFacing"}, {"point_coord", "gl_PointCoord"}, {"lane", "gl_SubgroupInvocationID"},
+        {"front_facing", "gl_FrontFacing"}, {"point_coord", "gl_PointCoord"}, {"lane", "(gl_SubgroupInvocationID & 31u)"},
         {"vid", "uint(gl_VertexIndex)"}, {"iid", "uint(gl_InstanceIndex)"},
     };
     const char *p = src;
@@ -1757,7 +1826,7 @@ static const char glsl_prelude[] =
     "#extension GL_KHR_shader_subgroup_basic : require\n"
     "#extension GL_KHR_shader_subgroup_shuffle : require\n"
     "#extension GL_KHR_shader_subgroup_shuffle_relative : require\n"
-    "#extension GL_EXT_texture_shadow_lod : require\n"
+    "#extension GL_EXT_texture_shadow_lod : enable\n"  // (enable: the Android NDK's older glslang lacks it)
     "#define cbr(cb, off) cb[min((off) >> 4, uint(cb.length() - 1))][((off) >> 2) & 3u]\n"
     "uint as_u(float x) { return floatBitsToUint(x); }\n"
     "uint as_u(uint x) { return x; }\n"
@@ -1784,7 +1853,17 @@ static const char glsl_prelude[] =
     "uint bfe_s(uint v, uint ctl) { uint pos = ctl & 0xFFu, len = (ctl >> 8) & 0xFFu; if (len == 0u) return 0u; if (pos >= 32u) return (int(v) < 0) ? 0xFFFFFFFFu : 0u; return uint(bitfieldExtract(int(v), int(pos), int(min(len, 32u - pos)))); }\n"
     "uint bfi(uint ins, uint ctl, uint base) { uint pos = ctl & 0xFFu, len = (ctl >> 8) & 0xFFu; if (len == 0u || pos >= 32u) return base; return bitfieldInsert(base, ins, int(pos), int(min(len, 32u - pos))); }\n"
     "float fswzadd(float a, float b, uint swz, uint lane) { uint m = (swz >> ((lane & 3u) * 2u)) & 3u; float ma = m == 1u ? -1.0f : (m == 3u ? 0.0f : 1.0f); float mb = m == 2u ? -1.0f : 1.0f; return a * ma + b * mb; }\n"
-    "uvec2 rsc(uvec2 c, vec4 s) { return (s.x == 1.0f && s.y == 1.0f) ? c : uvec2(floor((vec2(c) + 0.5f) * s.xy)); }\n";
+    "uvec2 rsc(uvec2 c, vec4 s) { return (s.x == 1.0f && s.y == 1.0f) ? c : uvec2(floor((vec2(c) + 0.5f) * s.xy)); }\n"
+    // SHFL: lanes of Maxwell's 32-wide warp, which is the subgroup on NVIDIA and a 32-lane slice of a wider one elsewhere
+    // (outside the slice: the lane's own value, as SHFL gives outside its segment)
+    "uint shfl_idx(uint v, uint i) { return subgroupShuffle(v, (gl_SubgroupInvocationID & ~31u) | (i & 31u)); }\n"
+    "float shfl_idx(float v, uint i) { return subgroupShuffle(v, (gl_SubgroupInvocationID & ~31u) | (i & 31u)); }\n"
+    "uint shfl_up(uint v, uint d) { uint l = gl_SubgroupInvocationID; uint s = subgroupShuffle(v, l - min(d, l)); return (l & 31u) >= d ? s : v; }\n"
+    "float shfl_up(float v, uint d) { uint l = gl_SubgroupInvocationID; float s = subgroupShuffle(v, l - min(d, l)); return (l & 31u) >= d ? s : v; }\n"
+    "uint shfl_down(uint v, uint d) { uint l = gl_SubgroupInvocationID; uint s = subgroupShuffle(v, min(l + d, gl_SubgroupSize - 1u)); return (l & 31u) + d < 32u ? s : v; }\n"
+    "float shfl_down(float v, uint d) { uint l = gl_SubgroupInvocationID; float s = subgroupShuffle(v, min(l + d, gl_SubgroupSize - 1u)); return (l & 31u) + d < 32u ? s : v; }\n"
+    "uint shfl_xor(uint v, uint m) { return subgroupShuffleXor(v, m & 31u); }\n"
+    "float shfl_xor(float v, uint m) { return subgroupShuffleXor(v, m & 31u); }\n";
 // The half <-> float helpers (glsl_finish: glsl_h2f_exact or glsl_h2f_native, then glsl_prelude_half).
 // Half -> float in vertex (and other pre-raster) shaders: by bits, not unpackHalf2x16. NVIDIA's driver recognises
 // unpacked halves and runs some of the fp32 math after them in native fp16, differently per shader, so a depth
@@ -1854,7 +1933,7 @@ static char *vel_rename(const char *src) {
 }
 
 // Declarations + entry point around the (rewritten) body; mirrors the MSL assembly in maxwell_translate.
-static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
+static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg, char *flags) {
     ShaderInfo *info = c->info;
     const ShaderKey *key = c->key;
     int stage = c->stage;
@@ -1867,7 +1946,10 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (c->fail) { free(body.buf); free(c->body.buf); free(c); return info; }
     int set = stage == STAGE_FRAGMENT ? 1 : 0;
     Str s = {0};
-    sp(&s, "%s", glsl_prelude);
+    if (info->uses_gmem && maxwell_gmem_chunk_shift)  // (the extension right after #version, before any declaration)
+        sp(&s, "#version 460\n#extension GL_EXT_buffer_reference : require\n%s", strchr(glsl_prelude, '\n') + 1);
+    else
+        sp(&s, "%s", glsl_prelude);
     static int exact = -1;
     if (exact < 0) exact = getenv("LARECOMP_VK_EXACT_H2F") && atoi(getenv("LARECOMP_VK_EXACT_H2F")) != 0;
     sp(&s, "%s%s", !exact && (stage == STAGE_FRAGMENT || stage == STAGE_COMPUTE) ? glsl_h2f_native : glsl_h2f_exact,
@@ -1900,7 +1982,13 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         sp(&s, "layout(std140, set = %d, binding = %d) uniform CB%d { uvec4 cb%d[%u]; };\n", set, i, i, i, n);
         if (vel_vs && i >= 3) sp(&s, "layout(std140, set = %d, binding = %d) uniform PCB%d { uvec4 pcb%d[%u]; };\n", set, 100 + i, i, i, n);
     }
-    if (info->uses_gmem)
+    if (info->uses_gmem && maxwell_gmem_chunk_shift) {  // the chunks' device addresses; GW(i): word i in its chunk
+        sp(&s, "layout(buffer_reference, std430, buffer_reference_align = 4) %sbuffer GChunk { uint w[]; };\n"
+               "layout(std430, set = %d, binding = %d) readonly buffer GMem { uint64_t base[]; } gmem_;\n",
+           c->uses_gmem_store ? "" : "readonly ", set, GMEM_BUFFER_INDEX);
+        sp(&s, "#define GW(i) GChunk(gmem_.base[(i) >> %du]).w[(i) & 0x%xu]\n", maxwell_gmem_chunk_shift - 2,
+           (1u << (maxwell_gmem_chunk_shift - 2)) - 1);
+    } else if (info->uses_gmem)
         sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GMem { uint w[]; } gmem_;\n", set, GMEM_BUFFER_INDEX,
            c->uses_gmem_store ? "" : "readonly ");
     if (c->uses_rscale && stage != STAGE_VERTEX) {
@@ -1938,6 +2026,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
             if (c->out_attr_mask & (1u << i)) sp(&s, "layout(location = %d) out vec4 v%d;\n", i, i);
         if (vel_vs) sp(&s, "layout(location = 30) out vec4 mv_prev_;\nlayout(location = 31) out vec4 mv_cur_;\n");
         if (key && key->jitter && !dbg) sp(&s, "layout(std140, set = 0, binding = 20) uniform Jit { vec4 jit; };\n");
+        if (key && key->widen && !dbg) sp(&s, "layout(std140, set = 0, binding = 21) uniform Wide { vec4 wide_; };\n");
     } else if (stage == STAGE_FRAGMENT) {
         if (vel_fs)
             sp(&s, "layout(location = 30) in vec4 mv_prev_;\nlayout(location = 31) in vec4 mv_cur_;\n"
@@ -1975,6 +2064,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         sp(&pre, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0u; uint pbk[16]; uint pbk_n = 0u; uint pcnt[16]; uint pcnt_n = 0u;\n");
         sp(&pre, "  bool exit_now = false;\n");
     }
+    if (c->straight) sp(&pre, "  bool live = true;\n%s", flags ? flags : "");
+    free(flags);
     for (int pass = 0; pass < (vel_vs ? 2 : 1); pass++) {
         char *b = body.buf ? body.buf : "";
         if (pass) {  // the previous frame's position: the body on pcb<k>, its outputs into locals
@@ -1999,6 +2090,20 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     free(pre.buf);
     free(body.buf);
     if (stage == STAGE_VERTEX) {
+        if (key && key->widen && !dbg) {
+            // (the interface, wide_.y: 1 - into the centred box, but what touches the screen's left or right edge stays
+            // at the window's (its positions have w != 1 too: x against w); 2 - a background, the screen's width the
+            // window's and its height grown as much, cropped: cover - every vertex alike, a background in pieces too)
+            // 3 - a camera-attached effect sized for 16:9: as it is, stretched to the window's width by the viewport;
+            // 4 - 3D with a depth test, its projection's perspective or not: the Pokedex's model is orthographic, w 1)
+            sp(&s, "  if (wide_.y > 3.5f) gl_Position.x *= wide_.x;\n"
+                   "  else if (wide_.y > 2.5f) {}\n"
+                   "  else if (wide_.y > 1.5f) gl_Position.y /= wide_.x;\n"
+                   "  else if (wide_.y > 0.5f) {\n"
+                   "    if (abs(gl_Position.x) < 0.999f * abs(gl_Position.w)) gl_Position.x *= wide_.x;\n"
+                   "  } else if (gl_Position.w != 1.0f) gl_Position.x *= wide_.x;\n");
+            if (vel_vs) sp(&s, "  if (mv_cur_.w != 1.0f) mv_cur_.x *= wide_.x;\n  if (mv_prev_.w != 1.0f) mv_prev_.x *= wide_.x;\n");
+        }
         if (key && key->jitter && !dbg) sp(&s, "  gl_Position.xy += jit.xy * gl_Position.w;\n");
         if (key && key->flip_y) sp(&s, "  gl_Position.y = -gl_Position.y;\n");
         if (key && key->depth_minus_one) sp(&s, "  gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5f;\n");
@@ -2108,13 +2213,32 @@ static ShaderInfo *translate(const uint8_t *blob, size_t max_size, int stage, co
     bool dbg = maxwell_dbg_code && blob == maxwell_dbg_code && stage == STAGE_FRAGMENT;
     static int annotate = -1;
     if (annotate < 0) annotate = getenv("LARECOMP_SAVE_MSL") != NULL;
-    c->branchy = any_branch;
+    c->straight = c->glsl && any_branch && straight_ok((const uint64_t *)code, end);
+    c->branchy = any_branch && !c->straight;
+    uint32_t sstack[16];
+    int sn = 0;
+    Str flags = {0};  // (straight) the jump flags' declarations
+    if (c->straight) sp(&c->body, "  if (live) {\n");
     for (size_t i = 0; i < end && !c->fail; i++) {
         if (i % 4 == 0) continue;
         uint32_t pc = (uint32_t)(i * 8);
-        if (any_branch && label[i]) sp(&c->body, "  case %uu:\n", pc);
-        if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)((const uint64_t *)code)[i]);
-        emit_insn(c, ((const uint64_t *)code)[i], pc);
+        uint64_t w = ((const uint64_t *)code)[i];
+        if (c->straight) {
+            while (sn && sstack[sn - 1] == pc) sn--;
+            if (label[i] && i != 1) {
+                sp(&c->body, "  }\n  live = live || jl%u;\n  if (live) {\n", pc);
+                sp(&flags, "  bool jl%u = false;\n", pc);
+            }
+            if ((w & 0xfff0000000000020ull) == 0xe290000000000000ull) sstack[sn++] = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
+            c->sync_target = sn ? sstack[sn - 1] : 0;
+        } else if (any_branch && label[i]) sp(&c->body, "  case %uu:\n", pc);
+        if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)w);
+        emit_insn(c, w, pc);
+        // (straight: what follows a branch, SYNC or EXIT runs only if `live` still is)
+        uint64_t top12 = w & 0xfff0000000000000ull;
+        if (c->straight && (top12 == 0xe240000000000000ull || top12 == 0xe300000000000000ull ||
+                            (w & 0xfff8000000000000ull) == 0xf0f8000000000000ull))
+            sp(&c->body, "  }\n  if (live) {\n");
         if (dbg && pc == maxwell_dbg_pc) {
             int rr = maxwell_dbg_reg % 1000, half = maxwell_dbg_reg / 1000;  // +1000: low f16, +2000: high f16
             c->reg_used[rr] = 1;
@@ -2124,8 +2248,9 @@ static ShaderInfo *translate(const uint8_t *blob, size_t max_size, int stage, co
         info->num_insts++;
     }
     free(label);
-    if (c->fail) { free(c->body.buf); free(c); return info; }
-    if (c->glsl) return glsl_finish(c, any_branch, dbg);
+    if (c->straight) sp(&c->body, "  }\n");
+    if (c->fail) { free(c->body.buf); free(flags.buf); free(c); return info; }
+    if (c->glsl) return glsl_finish(c, any_branch && !c->straight, dbg, flags.buf);
 
     // ---------------------------------------------------------- MSL source
     Str s = {0};
@@ -2281,8 +2406,8 @@ static ShaderInfo *translate(const uint8_t *blob, size_t max_size, int stage, co
 // CPU on the workers before their SPIR-V (cached on its own: vulkan/shaders.c) could even be looked up. cache/glsl.pak
 // keeps each translation's ShaderInfo and source, found again by a key of everything the output depends on: the
 // program's bytes (headers + instructions up to its end), the stage, the ShaderKey's fields, the heap's base and size
-// (in the global memory code) and the research switches the translator reads (LARECOMP_NO_DISCARD,
-// LARECOMP_VK_EXACT_H2F). The translator itself is the pak's: its header names the time this file was compiled, and a
+// (in the global memory code), its pages (maxwell_gmem_chunk_shift), straight code or not (LARECOMP_VK_STRAIGHT) and
+// the research switches the translator reads (LARECOMP_NO_DISCARD, LARECOMP_VK_EXACT_H2F). The translator itself is the pak's: its header names the time this file was compiled, and a
 // pak of another build is started again (a new build is cold once). One file, appended to: a file per translation
 // (as cache/spirv) cost ~4.6 ms each to write on Windows (its scanner), the cold run 2.7 s of translation instead of
 // 1.0, and the files just written were slow to read in the next run too.
@@ -2400,8 +2525,9 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     size_t len = (size_t)(code - blob) + code_end(code, (max_size - (code - blob)) / 8) * 8;
     uint64_t h[2] = {0xcbf29ce484222325ull, 0x9e3779b97f4a7c15ull};
     uint32_t meta[8] = {(uint32_t)stage, (uint32_t)len, key->vs_out_mask, (uint32_t)(getenv("LARECOMP_NO_DISCARD") != NULL),
-                        (uint32_t)(getenv("LARECOMP_VK_EXACT_H2F") && atoi(getenv("LARECOMP_VK_EXACT_H2F")) != 0)};
-    uint8_t kb[48] = {key->depth_minus_one, key->flip_y, key->glsl, key->velocity, key->vel_vs, key->vel_rt, key->jitter};
+                        (uint32_t)(getenv("LARECOMP_VK_EXACT_H2F") && atoi(getenv("LARECOMP_VK_EXACT_H2F")) != 0),
+                        (uint32_t)maxwell_gmem_chunk_shift, (uint32_t)straight_on()};  // (Android: page table, straight code)
+    uint8_t kb[48] = {key->depth_minus_one, key->flip_y, key->glsl, key->velocity, key->vel_vs, key->vel_rt, key->jitter, key->widen};
     memcpy(kb + 8, key->attr_kind, 32);
     memcpy(kb + 40, key->rt_kind, 8);
     uint64_t heap[2] = {maxwell_gmem_base, maxwell_gmem_size};

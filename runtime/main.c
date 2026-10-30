@@ -1,5 +1,8 @@
 // LAS Recomp entry: load modules, set up the kernel, run nn::init::Start on the main thread.
 #include <SDL3/SDL.h>
+#ifdef __ANDROID__
+#include <SDL3/SDL_main.h>  // (main is SDL_main there: SDL's Java activity calls it)
+#endif
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -178,6 +181,11 @@ int main(int argc, char **argv) {
         else if (argv[i][0] != '-') root = arg_root;
     }
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
+#ifdef __ANDROID__
+    // (the window and GPU device first: the game's memory pools go into GPU memory, their page table made when the game
+    // sets its heap up, exec.c renderer_share_heap)
+    { extern void ui_window_init(void); ui_window_init(); }
+#endif
     for (bool title = !skip_launcher;;) {
         if (title) {  // start screen: resolution, fullscreen, anti-aliasing, translation, keys (runtime/ui/launcher_lg.mm)
             extern void launcher_lg_run(const char *root);

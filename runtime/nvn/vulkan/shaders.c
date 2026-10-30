@@ -261,10 +261,20 @@ static const char *surf =
     "  n = normalize(cross(dx, dy));\n"
     "  if (dot(n, c) > 0.0) n = -n;\n"
     "}\n";
+// The colour grade (color.frag's: brightness, contrast, saturation) in the present itself when it is the last of the
+// post passes (exec.c post_process): grade.w > 0.5 applies it - one full-size pass less.
+#define PRESENT_GRADE                                                                       \
+    "vec3 grade(vec3 c) {\n"                                                                \
+    "  if (pc.grade.w < 0.5) return c;\n"                                                   \
+    "  c = (c * pc.grade.x - 0.5) * pc.grade.y + 0.5;\n"                                    \
+    "  c = mix(vec3(dot(c, vec3(0.2126, 0.7152, 0.0722))), c, pc.grade.z);\n"               \
+    "  return clamp(c, 0.0, 1.0);\n"                                                        \
+    "}\n"
 static const char *builtin_src(const char *name, int *stage) {
     if (!strcmp(name, "present.vert")) {
         *stage = STAGE_VERTEX;
-        // pv[0].x: flip (lower-left origin), pv[1]: uv crop (origin, size). Fullscreen triangle; Vulkan NDC y points down.
+        // pv[0].x: flip (lower-left origin), pv[1]: uv crop (origin, size); pv[2] (the colour grade) is the fragment
+        // shader's. Fullscreen triangle; Vulkan NDC y points down.
         return "#version 450\n"
                "layout(push_constant) uniform P { vec4 a; vec4 crop; } pc;\n"
                "layout(location = 0) out vec2 uv;\n"
@@ -279,18 +289,37 @@ static const char *builtin_src(const char *name, int *stage) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"
                "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 crop; vec4 grade; } pc;\n"
                "layout(location = 0) in vec2 uv;\n"
                "layout(location = 0) out vec4 o;\n"
+               PRESENT_GRADE
                // A render resolution above the window's (the launcher's 1440p / 4K on a smaller screen: supersampling)
                // is reduced with four bilinear taps spread over each window pixel's footprint - one bilinear tap
                // skips texels and keeps the jaggies (exactly 2x: the 2x2 box).
+               // a.y > 0: an optical flow in-between image shown pixel for pixel, sharpened here as flow_sharp.frag
+               // would (exec.c flow_image: one full-size pass less) - its interface (alpha 1) as it is.
                "void main() {\n"
+               "  if (pc.a.y > 0.0) {\n"
+               "    ivec2 z = textureSize(t, 0) - 1, p = clamp(ivec2(uv * vec2(z + 1)), ivec2(0), z);\n"
+               "    vec4 c4 = texelFetch(t, p, 0);\n"
+               "    if (c4.a > 0.5) { o = vec4(grade(c4.rgb), 1.0); return; }\n"
+               "    vec3 c = c4.rgb, mn = c, mx = c, s = vec3(0.0);\n"
+               "    for (int y = -1; y <= 1; y++)\n"
+               "      for (int x = -1; x <= 1; x++) {\n"
+               "        if (x == 0 && y == 0) continue;\n"
+               "        vec3 n = texelFetch(t, clamp(p + ivec2(x, y), ivec2(0), z), 0).rgb;\n"
+               "        mn = min(mn, n); mx = max(mx, n);\n"
+               "        if (x == 0 || y == 0) s += n;\n"
+               "      }\n"
+               "    o = vec4(grade(clamp(c + pc.a.y * (c - s * 0.25), mn, mx)), 1.0);\n"
+               "    return;\n"
+               "  }\n"
                "  vec2 d = vec2(dFdx(uv.x), dFdy(uv.y)), r = abs(d) * vec2(textureSize(t, 0));\n"
-               "  if (max(r.x, r.y) < 1.05) { o = vec4(texture(t, uv).rgb, 1.0); return; }\n"
+               "  if (max(r.x, r.y) < 1.05) { o = vec4(grade(texture(t, uv).rgb), 1.0); return; }\n"
                "  vec2 q = d * 0.25;\n"
                "  vec3 c = texture(t, uv + vec2(-q.x, -q.y)).rgb + texture(t, uv + vec2(q.x, -q.y)).rgb +\n"
                "           texture(t, uv + vec2(-q.x, q.y)).rgb + texture(t, uv + vec2(q.x, q.y)).rgb;\n"
-               "  o = vec4(c * 0.25, 1.0);\n"
+               "  o = vec4(grade(c * 0.25), 1.0);\n"
                "}\n";
     }
     // ---- post passes before the present (Video tab "Anti-aliasing" / "Upscaler"): exec.c vk_present_draw.
@@ -452,6 +481,30 @@ static const char *builtin_src(const char *name, int *stage) {
                "  }\n"
                "  float n = h12(px) + h12(px * 1.31 + 7.0) - 1.0;\n"
                "  o = vec4(clamp(c + n / 255.0, 0.0, 1.0), 1.0);\n"
+               "}\n";
+    }
+    // DittoSR's line pass on its in-between images (exec.c post_process_ex; its real frames take x2_final.frag): the
+    // detail of a 3x3 neighbourhood (the pixel less its 1-2-1 blur) amplified, dark detail (lines: eyebrows, lashes) by
+    // a.x, light by a.y, within the neighbourhood's range and a.z of it below - lines darken, no halos
+    if (!strcmp(name, "ditto_line.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "vec3 tap(ivec2 p) { return texelFetch(t, clamp(p, ivec2(0), ivec2(pc.b.xy) - 1), 0).rgb; }\n"
+               "void main() {\n"
+               "  ivec2 ip = ivec2(gl_FragCoord.xy);\n"
+               "  vec3 a = tap(ip + ivec2(-1, -1)), b = tap(ip + ivec2(0, -1)), c = tap(ip + ivec2(1, -1));\n"
+               "  vec3 d = tap(ip + ivec2(-1, 0)), e = tap(ip), f = tap(ip + ivec2(1, 0));\n"
+               "  vec3 g = tap(ip + ivec2(-1, 1)), h = tap(ip + ivec2(0, 1)), i = tap(ip + ivec2(1, 1));\n"
+               "  vec3 blur = (4.0 * e + 2.0 * (b + d + f + h) + (a + c + g + i)) / 16.0;\n"
+               "  vec3 det = e - blur;\n"
+               "  float dl = dot(det, vec3(0.25, 0.5, 0.25));\n"
+               "  vec3 r = e + (dl < 0.0 ? pc.a.x : pc.a.y) * det;\n"
+               "  vec3 mn = min(min(min(a, b), min(c, d)), min(min(e, f), min(min(g, h), i)));\n"
+               "  vec3 mx = max(max(max(a, b), max(c, d)), max(max(e, f), max(max(g, h), i)));\n"
+               "  o = vec4(clamp(r, max(mn - pc.a.z * (mx - mn), 0.0), mx), 1.0);\n"
                "}\n";
     }
     if (!strcmp(name, "rcas.frag")) {
@@ -1013,6 +1066,310 @@ static const char *builtin_src(const char *name, int *stage) {
                "  o = vec4(mix(c, hc, pc.b.x), 1.0);\n"
                "}\n";
     }
+    // ---- DittoSR's convert pass (exec.c gsr2_run): Snapdragon GSR 2's (Qualcomm's Game Super Resolution 2,
+    // third_party/snapdragon-gsr/LICENSE.txt: BSD 3-Clause; its 2-pass fragment variant, sgsr/v2/include/glsl_2_pass_fs)
+    // with the parameters as push constants instead of its uniform buffer, gl_FragCoord instead of the vertex shader's
+    // uv, and our motion vectors (this frame's uv - the previous one's, camera and objects: mv_run) instead of its
+    // clip-space velocity texture - its motion is in NDC, 2 x ours, the previous uv uv - 0.5 x motion. Then the motion
+    // of the nearest of the 3x3 (ours: a moving silhouette's own over the background around it, no trail behind its edges).
+    // a.xy = render size, b.xy = 1 / render size, d.x = tan(horizontal fov / 2).
+    // gsr2_convert.frag (render size, RGBA16F): xy = the motion (NDC), z = depth clip (how far this pixel's depth stands
+    // out from its 4x4 neighbourhood's: its history is less trusted), w = the nearest of the 3x3's nearness (1 - depth:
+    // x2_upscale.frag's disocclusion reads the previous frame's). t0 = depth (1: far), t1 = our motion vectors.
+    if (!strcmp(name, "gsr2_convert.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; vec4 c; vec4 d; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "layout(set = 0, binding = 0) uniform sampler2D InputDepth;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D InputVelocity;\n"
+               "void main() {\n"
+               "  vec2 renderSize = pc.a.xy, renderSizeRcp = pc.b.xy;\n"
+               "  vec2 texCoord = gl_FragCoord.xy * renderSizeRcp;\n"
+               "  vec2 gatherCoord = texCoord - vec2(0.5) * renderSizeRcp;\n"
+               "  vec4 btmLeft = textureGather(InputDepth, gatherCoord, 0);\n"
+               "  vec4 btmRight = textureGather(InputDepth, gatherCoord + vec2(renderSizeRcp.x * 2.0, 0.0), 0);\n"
+               "  vec4 topLeft = textureGather(InputDepth, gatherCoord + vec2(0.0, renderSizeRcp.y * 2.0), 0);\n"
+               "  vec4 topRight = textureGather(InputDepth, gatherCoord + renderSizeRcp * 2.0, 0);\n"
+               "  float maxC = min(min(min(btmLeft.z, btmRight.w), topLeft.y), topRight.x);\n"
+               "  float btmLeft4 = min(min(min(btmLeft.y, btmLeft.x), btmLeft.z), btmLeft.w);\n"
+               "  float depthclip = 0.0;\n"
+               "  if (maxC < 1.0 - 1.0e-05) {\n"
+               "    float btmRight4 = min(min(min(btmRight.y, btmRight.x), btmRight.z), btmRight.w);\n"
+               "    float topLeft4 = min(min(min(topLeft.y, topLeft.x), topLeft.z), topLeft.w);\n"
+               "    float topRight4 = min(min(min(topRight.y, topRight.x), topRight.z), topRight.w);\n"
+               "    float Ksep_Kfov_diagonal = 1.37e-05 * pc.d.x * length(renderSize);\n"
+               "    float Depthsep = Ksep_Kfov_diagonal * (1.0 - maxC);\n"
+               "    float Wdepth = clamp(Depthsep / (abs(maxC - btmLeft4) + 1.19e-07), 0.0, 1.0)\n"
+               "                 + clamp(Depthsep / (abs(maxC - btmRight4) + 1.19e-07), 0.0, 1.0)\n"
+               "                 + clamp(Depthsep / (abs(maxC - topLeft4) + 1.19e-07), 0.0, 1.0)\n"
+               "                 + clamp(Depthsep / (abs(maxC - topRight4) + 1.19e-07), 0.0, 1.0);\n"
+               "    depthclip = clamp(1.0 - Wdepth * 0.25, 0.0, 1.0);\n"
+               "  }\n"
+               "  ivec2 ms = textureSize(InputVelocity, 0);\n"
+               "  ivec2 mp = clamp(ivec2(texCoord * vec2(ms)), ivec2(0), ms - 1);\n"
+               "  ivec2 dp = ivec2(gl_FragCoord.xy), ds = textureSize(InputDepth, 0) - 1, best = ivec2(0);\n"
+               "  float dmin = 2.0;\n"
+               "  for (int i = 0; i < 9; i++) {\n"
+               "    ivec2 q = ivec2(i % 3 - 1, i / 3 - 1);\n"
+               "    float dd = texelFetch(InputDepth, clamp(dp + q, ivec2(0), ds), 0).r;\n"
+               "    if (dd < dmin) { dmin = dd; best = q; }\n"
+               "  }\n"
+               "  vec2 v = texelFetch(InputVelocity, clamp(mp + best, ivec2(0), ms - 1), 0).xy;\n"
+               "  o = vec4(2.0 * v, depthclip, 1.0 - dmin);\n"
+               "}\n";
+    }
+    // ---- DittoSR (exec.c gsr2_run, UPSCALE_DITTOSR): GSR 2's convert pass, then an upscale of our own, and a final
+    // pass. Push constants as GSR 2's (a = render size, output size; b = their reciprocals; c.xy = the jitter, c.z = output
+    // / render width; d.z = reset; research knobs, 0 their defaults: d.x the history's largest weight (10), d.y the
+    // confidence the narrow estimate is taken alone from (0.05), d.w the history clip width at rest (1.5).
+    // x2_upscale.frag (e.x the reaction to changes, e.y the edge-directed Gaussian, e.z thin lines kept; f and g below):
+    // t0 = the previous output, t1 = gsr2_convert's (xy motion in NDC, z depth clip), t2 = the colour, t3 =
+    // the previous frame's gsr2_convert, t4 = x2_change.frag's.
+    //   The current frame: the 3x3 render samples around the pixel, each where its jitter put it, weighted by a Gaussian
+    //   of its distance in output pixels (narrow: confident where a sample landed close) and by a wider one in render
+    //   pixels (smooth: where none did; mostly the narrow one). The history: Catmull-Rom at the previous position, clipped toward the samples'
+    //   mean in YCoCg to mean +- gamma sigma (gamma narrower moving and where the depth stands out). The blend by
+    //   weight: the history keeps its accumulated weight (alpha: RGBA16F), less when clipped, moving or where the depth
+    //   stands out, at most d.x (10); the new frame adds its samples' nearness (0.03 - 1) - a weighted mean of every
+    //   jittered sample, not a fixed share (GSR 2's stepped share made its pattern; a fixed one stepped the edges).
+    //   Against ghosting: where the motion differs from the previous frame's where the pixel was (another object there
+    //   now), less history and a narrower box; moving, the box within the 9 samples' own min / max. The fast settling:
+    //   with much of the image changed (x2_change.frag), the reaction takes the new frame up to 0.95 instead of 0.5.
+    // x2_final.frag: the sharpening (the standalone DittoSR's: contrast-adaptive, a.x its strength, faded out as the
+    //   pixel moves and with a low stability level) and the interface composited (a.w = 1 with a mask:
+    //   ui_composite.frag's), in one pass. t0 = the upscale, t1 = the image (render size), m = mask, mv = gsr2_convert's.
+    //   The stability: a level per pixel in the history's alpha (its 2 bits: 0, 1/3, 2/3, 1), one step up each frame the
+    //   history holds, back to 0 where it was cut (the history well outside the box, another object there, the depth
+    //   standing out, much of the image changed). At rest a stable pixel takes less of each new frame (0.2 -> 0.035 of
+    //   the base share - d.x, LARECOMP_EXP2_ALPHA; a fixed 0.05 before) within a box 35 % wider: the jittered samples' noise no longer shimmers,
+    //   and a pixel just cut converges as fast as before. At 2x, 4K (PC): shimmer at rest -11 - 16 %, fine noise moving
+    //   -55 %, the menu's image gone ~30 % sooner after it closed; 0.46 ms as before.
+    // (the upscale as in the standalone DittoSR - its shaders/upscale.hlsl, tuned on Cyberpunk 2077 - 112 bytes of
+    // constants: then f.x the new frame's base share moving (0.15), f.y the colour's Gaussian width moving (1.6), f.z b.y
+    // moving (1.5), f.w the history clipped by its low frequencies (1); g.x the disocclusion (0) or GSR 2's depth clip
+    // (1), g.y the clip width moving (1.5), g.z how far the box keeps within the samples' min / max moving (1), g.w the
+    // frame weight - x the new frame's share (dittosr_frame_weight). Moving, the colour through a wider Gaussian and
+    // less of the new frame (the render grid showed as a stipple); the motion change against the neighbours' (the camera
+    // speeding up cut the whole history); the disocclusion from gsr2_convert's nearness (w); the history clipped by its
+    // low frequencies (the samples' aliasing dragged its detail toward one frame))
+    if (!strcmp(name, "x2_upscale.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; vec4 c; vec4 d; vec4 e; vec4 f; vec4 g; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "layout(set = 0, binding = 0) uniform sampler2D PrevOutput;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D MotionDepthClip;\n"
+               "layout(set = 0, binding = 2) uniform sampler2D InputColor;\n"
+               "layout(set = 0, binding = 3) uniform sampler2D PrevMda;\n"
+               "layout(set = 0, binding = 4) uniform sampler2D Change;\n"
+               "vec3 ycc(vec3 c) { return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * (c.r - c.b), 0.5 * c.g - 0.25 * (c.r + c.b)); }\n"
+               "vec3 rgb(vec3 y) { return vec3(y.x + y.y - y.z, y.x + y.z, y.x - y.y - y.z); }\n"
+               "vec3 hist(vec2 uv, out vec3 low) {\n"  // (Catmull-Rom in 5 bilinear taps; low: their plain mean, ~3 pixels wide)
+               "  vec2 sz = pc.a.zw, p = uv * sz, c1 = floor(p - 0.5) + 0.5, f = p - c1;\n"
+               "  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);\n"
+               "  vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f), w12 = w1 + w2;\n"
+               "  vec2 q0 = (c1 - 1.0) / sz, q3 = (c1 + 2.0) / sz, q12 = (c1 + w2 / w12) / sz;\n"
+               "  vec3 ta = textureLod(PrevOutput, vec2(q12.x, q0.y), 0.0).rgb, tb = textureLod(PrevOutput, vec2(q0.x, q12.y), 0.0).rgb;\n"
+               "  vec3 tc = textureLod(PrevOutput, q12, 0.0).rgb, td = textureLod(PrevOutput, vec2(q3.x, q12.y), 0.0).rgb;\n"
+               "  vec3 te = textureLod(PrevOutput, vec2(q12.x, q3.y), 0.0).rgb;\n"
+               "  low = 0.2 * (ta + tb + tc + td + te);\n"
+               "  vec3 r = ta * w12.x * w0.y + tb * w0.x * w12.y + tc * w12.x * w12.y + td * w3.x * w12.y + te * w12.x * w3.y;\n"
+               "  float ws = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;\n"
+               "  return clamp(r / ws, 0.0, 1.0);\n"
+               "}\n"
+               "void main() {\n"
+               "  vec2 rs = pc.a.xy, os = pc.a.zw, jit = pc.c.xy;\n"
+               "  vec2 uv = gl_FragCoord.xy * pc.b.zw, q = uv * rs;\n"
+               "  vec4 mda4 = textureLod(MotionDepthClip, uv, 0.0);\n"
+               "  float mlen = length(0.5 * mda4.xy * os);\n"
+               // (moving - from 4 output pixels a frame - the history holds little and the frame's own samples carry the
+               // image: its colour through a wider Gaussian (f.y), the narrow one, nearly the nearest sample, showing the
+               // render samples' grid as a stipple. The samples' confidence - the new frame's share - stays the narrow one's)
+               "  float mf = clamp((mlen - 0.5) / 3.5, 0.0, 1.0), wd = pc.c.w > 0.0 ? pc.c.w : 1.0;\n"
+               "  float ks = max(pc.c.z, 1.0) / wd, km = max(pc.c.z, 1.0) / (pc.f.y > 0.0 ? pc.f.y : wd);\n"
+               "  ivec2 b0 = ivec2(floor(q + jit)), cs = textureSize(InputColor, 0) - 1;\n"
+               "  vec3 cc[9]; float l[9];\n"
+               "  for (int i = 0; i < 9; i++) {\n"
+               "    cc[i] = texelFetch(InputColor, clamp(b0 + ivec2(i % 3 - 1, i / 3 - 1), ivec2(0), cs), 0).rgb;\n"
+               "    l[i] = dot(cc[i], vec3(0.25, 0.5, 0.25));\n"
+               "  }\n"
+               // the edge (e.y): the samples' luma gradient (Sobel); the Gaussian stretched along it, narrow across it
+               "  float gx = (l[2] + 2.0 * l[5] + l[8]) - (l[0] + 2.0 * l[3] + l[6]);\n"
+               "  float gy = (l[6] + 2.0 * l[7] + l[8]) - (l[0] + 2.0 * l[1] + l[2]);\n"
+               "  float lmn = l[0], lmx = l[0], lsum = 0.0;\n"
+               "  for (int i = 0; i < 9; i++) { lmn = min(lmn, l[i]); lmx = max(lmx, l[i]); lsum += l[i]; }\n"
+               "  float g = length(vec2(gx, gy)), es = clamp(g / (4.0 * (lmx - lmn) + 1e-3), 0.0, 1.0);\n"
+               "  vec2 nrm = g > 1e-5 ? vec2(gx, gy) / g : vec2(1.0, 0.0);\n"
+               "  float along = 1.0 - 0.75 * pc.e.y * es;\n"
+               // the thin line (e.z): the centre sample a local extreme of its 3x3 - a lash, an eyebrow
+               "  float omn = 1.0, omx = 0.0;\n"
+               "  for (int i = 0; i < 9; i++) if (i != 4) { omn = min(omn, l[i]); omx = max(omx, l[i]); }\n"
+               "  float ext = max(omn - l[4], l[4] - omx) / (lmx - lmn + 1e-3);\n"
+               "  float lockf = pc.e.z * clamp(ext * 4.0 + 0.5 * step(0.0, ext), 0.0, 1.0);\n"
+               "  vec3 sg = vec3(0.0), sm = vec3(0.0), ss = vec3(0.0), m1 = vec3(0.0), m2 = vec3(0.0), ymn = vec3(1e9), ymx = vec3(-1e9);\n"
+               "  float wg = 0.0, wm = 0.0, wsum = 0.0;\n"
+               "  for (int i = 0; i < 9; i++) {\n"
+               "    vec2 d = vec2(b0 + ivec2(i % 3 - 1, i / 3 - 1)) + 0.5 - jit - q;\n"
+               "    float dn = dot(d, nrm), dt = dot(d, vec2(-nrm.y, nrm.x)), r2 = dn * dn + dt * dt * along;\n"
+               "    float w = exp(-2.26 * r2 * ks * ks), w2 = exp(-1.4 * dot(d, d)), w3 = exp(-2.26 * r2 * km * km);\n"
+               "    sg += cc[i] * w; wg += w; ss += cc[i] * w2; wsum += w2; sm += cc[i] * w3; wm += w3;\n"
+               "    vec3 yc = ycc(cc[i]); m1 += yc; m2 += yc * yc; ymn = min(ymn, yc); ymx = max(ymx, yc);\n"
+               "  }\n"
+               "  m1 /= 9.0; vec3 sig = sqrt(max(m2 / 9.0 - m1 * m1, 0.0));\n"
+               "  vec3 cg = mix(sg / max(wg, 1e-6), sm / max(wm, 1e-6), mf), cs2 = ss / max(wsum, 1e-6);\n"
+               "  float conf = clamp(wg, 0.0, 1.0);\n"
+               "  vec3 cur = mix(cs2, cg, smoothstep(0.05, pc.d.y > 0.0 ? pc.d.y : 0.6, conf));\n"
+               "  vec3 mda = mda4.xyz;\n"
+               "  vec2 puv = uv - 0.5 * mda.xy;\n"
+               // (g.x = 1, GSR 2's depth clip: only as far as the pixel moves - at rest a silhouette stands out every frame,
+               // alternating. g.x = 0: the disocclusion below instead)
+               "  mda.z *= clamp(mlen * 0.5, 0.0, 1.0);\n"
+               "  if (pc.d.w < 0.0) { o = vec4(clamp(abs(0.5 * mda.xy * os) * 64.0, 0.0, 1.0), 0.0, 1.0); return; }\n"
+               "  bool off = any(lessThan(puv, vec2(0.0))) || any(greaterThan(puv, vec2(1.0)));\n"
+               "  if (pc.d.z > 0.5 || off) { o = vec4(cs2, 0.0); return; }\n"
+               "  vec3 hl, hy = ycc(hist(puv, hl));\n"
+               "  hl = ycc(hl);\n"
+               // (the stability level where the pixel was - the history's alpha)
+               "  float sp = textureLod(PrevOutput, puv, 0.0).a;\n"
+               // (the previous frame's motion where this pixel was: changed by over half a pixel more than its
+               // neighbours' - another object's - less history, a narrower box. Against the neighbours: the camera
+               // speeding up or slowing down changes every pixel's motion alike and cut the whole history; another
+               // object's edge changes it here and not a little way off. The neighbours as far as the change itself, so a
+               // revealed strip's lie outside it)
+               "  vec4 pm = textureLod(PrevMda, puv, 0.0);\n"
+               "  vec2 dlt = 0.5 * (mda4.xy - pm.xy) * os;\n"
+               "  float rad = clamp(length(dlt), 2.0, 16.0), pdif = 0.0;\n"
+               "  for (int n = 0; n < 4; n++) {\n"
+               "    vec2 nuv = uv + vec2(n == 0 ? rad : n == 1 ? -rad : 0.0, n == 2 ? rad : n == 3 ? -rad : 0.0) * pc.b.zw;\n"
+               "    vec2 nm = textureLod(MotionDepthClip, nuv, 0.0).xy;\n"
+               "    vec2 npm = textureLod(PrevMda, nuv - 0.5 * nm, 0.0).xy;\n"
+               "    pdif = max(pdif, length(dlt - 0.5 * (nm - npm) * os));\n"
+               "  }\n"
+               "  float rj = smoothstep(0.5, 2.0, pdif);\n"
+               // (the disocclusion, g.x = 0: where the pixel was, the previous frame's surfaces - even the farthest of the
+               // four around it - nearer than this one, and moving otherwise than it: it was hidden behind something that
+               // moved away. A turn of the camera, a still scene, or a thin line the jitter hits one frame and misses the
+               // next keep the history - GSR 2's depth clip cut it at every depth edge as soon as anything moved)
+               "  if (pc.g.x < 0.5) {\n"
+               "    vec4 pn = textureGather(PrevMda, puv, 3);\n"
+               "    float np = min(min(pn.x, pn.y), min(pn.z, pn.w)), nc = mda4.w;\n"
+               "    float nearer = np > 1e-7 ? smoothstep(0.03, 0.15, 1.0 - nc / np) : 0.0;\n"
+               "    mda.z = nearer * smoothstep(0.25, 1.0, pdif);\n"
+               "  }\n"
+               // (the share of the image that changed against its history - x2_change.frag's one pixel)
+               "  float gch = smoothstep(0.2, 0.5, texelFetch(Change, ivec2(0), 0).r);\n"
+               "  float rest = pc.d.w > 0.0 ? pc.d.w : 1.5;\n"
+               "  float gam = mix(rest, pc.g.y > 0.0 ? pc.g.y : 0.9, clamp(mlen * 0.25, 0.0, 1.0)) * (1.0 - 0.5 * mda.z);\n"
+               "  gam = mix(gam, 1.5 * rest, lockf);\n"
+               "  gam *= 1.0 - 0.6 * rj;\n"
+               // (stable and at rest, a wider box - the jittered samples' own spread no longer cuts the history)
+               "  gam *= 1.0 + 0.35 * sp * (1.0 - clamp(mlen, 0.0, 1.0));\n"
+               // (moving: the box mean +- gamma sigma within the samples' own range - min / max, as far as the pixel moves)
+               "  vec3 blo = m1 - gam * sig, bhi = m1 + gam * sig;\n"
+               "  float mm = pc.g.z * clamp(mlen * 0.5, 0.0, 1.0);\n"
+               "  blo = mix(blo, max(blo, ymn), mm); bhi = mix(bhi, min(bhi, ymx), mm);\n"
+               "  vec3 bc = 0.5 * (blo + bhi), ext3 = 0.5 * (bhi - blo) + vec3(1.0 / 255.0);\n"
+               // (f.w = 1: the box against the history's low frequencies - the jittered samples' aliasing of fine detail no
+               // longer counts as a change - the clip moving those alone; the detail above them kept, fading as the low
+               // ones fall far out: a real change, the detail stale as well. Else the whole history clipped, in motion
+               // toward one aliased frame)
+               "  vec3 hc = pc.f.w > 0.5 ? hl : hy;\n"
+               "  vec3 dir = hc - bc;\n"
+               "  vec3 ad = abs(dir) / ext3;\n"
+               "  float t = max(ad.x, max(ad.y, ad.z));\n"
+               "  vec3 hcc = t > 1.0 ? bc + dir / t : hc;\n"
+               "  hy = pc.f.w > 0.5 ? hcc + (hy - hl) * (1.0 - smoothstep(1.0, 2.5, t)) : hcc;\n"
+               // (moving: f.x of the new frame (0.3 before: the pixels a sample landed near took up to 90 % of it, their
+               // neighbours almost none - the render grid as a stipple), and less contrast between them - f.z for b.y)
+               "  float base = mix(mix(0.2, pc.d.x > 0.0 ? pc.d.x : 0.035, sp), pc.f.x > 0.0 ? pc.f.x : 0.3, clamp(mlen * 0.125, 0.0, 1.0));\n"
+               "  float sn = pc.b.y > 0.0 ? pc.b.y : 1.4;\n"
+               "  if (pc.f.z > 0.0) sn = mix(sn, pc.f.z, mf);\n"
+               "  float a = base * mix(pc.b.x > 0.0 ? pc.b.x : 0.6, sn, smoothstep(0.05, 0.8, conf));\n"
+               // (g.w, the frame weight: the user's persistence - the reactions below still take over where something changed)
+               "  a = clamp(a * (pc.g.w > 0.0 ? pc.g.w : 1.0), 0.0, 1.0);\n"
+               "  a = mix(a, 0.6, mda.z);\n"
+               // the reaction (e.x): the history outside the samples' range by t - something changed - the new frame by it
+               // (with much of the image changed the reaction goes further: the new frame up to 0.95 - gch)
+               "  a = mix(a, mix(0.5, 0.95, gch), clamp((t - 1.0) * pc.e.x, 0.0, 1.0) * (1.0 - lockf));\n"
+               "  a = mix(a, max(a, 0.5), gch);\n"
+               "  a = mix(a, max(a, 0.6), rj);\n"
+               // (the stability for the next frame: 0 where the history was cut, else one step up)
+               "  bool cut = t > 1.25 || rj > 0.5 || mda.z > 0.5 || gch > 0.5;\n"
+               "  o = vec4(mix(rgb(hy), cur, clamp(a, 0.0, 1.0)), cut ? 0.0 : min(sp + 0.34, 1.0));\n"
+               "}\n";
+    }
+    if (!strcmp(name, "x2_final.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t0;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D t1;\n"
+               "layout(set = 0, binding = 2) uniform sampler2D m;\n"
+               "layout(set = 0, binding = 3) uniform sampler2D mv;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "vec3 tap(ivec2 p) { return texelFetch(t0, clamp(p, ivec2(0), ivec2(pc.b.xy) - 1), 0).rgb; }\n"
+               "vec3 cr(vec2 uv) {\n"
+               "  vec2 sz = vec2(textureSize(t1, 0)), p = uv * sz, c1 = floor(p - 0.5) + 0.5, f = p - c1;\n"
+               "  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);\n"
+               "  vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f), w12 = w1 + w2;\n"
+               "  vec2 q0 = (c1 - 1.0) / sz, q3 = (c1 + 2.0) / sz, q12 = (c1 + w2 / w12) / sz;\n"
+               "  vec3 r = texture(t1, vec2(q12.x, q0.y)).rgb * w12.x * w0.y + texture(t1, vec2(q0.x, q12.y)).rgb * w0.x * w12.y\n"
+               "         + texture(t1, q12).rgb * w12.x * w12.y + texture(t1, vec2(q3.x, q12.y)).rgb * w3.x * w12.y\n"
+               "         + texture(t1, vec2(q12.x, q3.y)).rgb * w12.x * w3.y;\n"
+               "  float ws = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;\n"
+               "  return clamp(r / ws, 0.0, 1.0);\n"
+               "}\n"
+               "void main() {\n"
+               "  ivec2 ip = ivec2(gl_FragCoord.xy);\n"
+               "  vec2 uv = gl_FragCoord.xy * pc.b.zw;\n"
+               "  vec4 c4 = texelFetch(t0, ip, 0);\n"
+               "  vec3 c = c4.rgb, n = tap(ip + ivec2(0, -1)), s = tap(ip + ivec2(0, 1)), w = tap(ip + ivec2(-1, 0)), e = tap(ip + ivec2(1, 0));\n"
+               "  float mlen = length(0.5 * textureLod(mv, uv, 0.0).xy * pc.b.xy);\n"
+               "  float k = pc.a.x * (1.0 - clamp(mlen * 0.5, 0.0, 1.0)) * (0.5 + 0.5 * c4.a);\n"
+               "  vec3 mn = min(c, min(min(n, s), min(w, e))), mx = max(c, max(max(n, s), max(w, e)));\n"
+               "  vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0));\n"
+               "  vec3 wgt = -amp * k;\n"
+               "  vec3 r = clamp((c + wgt * (n + s + w + e)) / (1.0 + 4.0 * wgt), 0.0, 1.0);\n"
+               "  float ki = pc.a.w > 0.5 ? texture(m, uv).r : 0.0;\n"
+               "  o = vec4(ki > 0.0 ? mix(r, cr(uv), ki) : r, 1.0);\n"
+               "}\n";
+    }
+    // x2_change.frag (DittoSR's fast settling, exec.c gsr2_run): a.x = 0, a 4 x 4 image (R16F),
+    // each pixel 16 points of a 16 x 16 grid over the render image - the share of them whose colour this frame differs
+    // from the history (the previous upscale) where the point was by over 0.1 in luma; a.x = 1, that image averaged into
+    // one pixel (t0), the one texel x2_upscale.frag reads (the 4 x 4 read by every pixel: +0.025 ms at 4K; the 256 points
+    // in one pixel: 0.15 ms, one after another). A
+    // scene change, a menu closing, a fade: most of the image at once - its reaction then goes further. t0 = the
+    // history, t1 = gsr2_convert's (motion), t2 = the colour.
+    if (!strcmp(name, "x2_change.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D Hist;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D Mda;\n"
+               "layout(set = 0, binding = 2) uniform sampler2D Color;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() {\n"
+               "  if (pc.a.x > 0.5) {\n"
+               "    float s = 0.0;\n"
+               "    for (int i = 0; i < 16; i++) s += texelFetch(Hist, ivec2(i % 4, i / 4), 0).r;\n"
+               "    o = vec4(s / 16.0);\n"
+               "    return;\n"
+               "  }\n"
+               "  ivec2 p = ivec2(gl_FragCoord.xy), rs = textureSize(Color, 0);\n"
+               "  float n = 0.0, c = 0.0;\n"
+               "  for (int i = 0; i < 16; i++) {\n"
+               "    vec2 g = (vec2(p * 4 + ivec2(i % 4, i / 4)) + 0.5) / 16.0;\n"
+               "    ivec2 q = ivec2(g * vec2(rs));\n"
+               "    vec2 puv = (vec2(q) + 0.5) / vec2(rs) - 0.5 * texelFetch(Mda, q, 0).xy;\n"
+               "    if (any(lessThan(puv, vec2(0.0))) || any(greaterThan(puv, vec2(1.0)))) continue;\n"
+               "    float d = abs(dot(texelFetch(Color, q, 0).rgb - textureLod(Hist, puv, 0.0).rgb, vec3(0.25, 0.5, 0.25)));\n"
+               "    c += step(0.1, d); n += 1.0;\n"
+               "  }\n"
+               "  o = vec4(n > 0.0 ? c / n : 0.0);\n"
+               "}\n";
+    }
     // FSR 3.1's output with the interface composited after it (exec.c post_process_ex): t0 = FSR's output, t1 = the image
     // it was given (the render size, the interface not jittered), m = the interface mask (render size). Where the mask
     // says interface (bilinear: its edges blend), t1 by Catmull-Rom (5 bilinear taps, as side_resolve.frag's history).
@@ -1090,7 +1447,9 @@ static const char *builtin_src(const char *name, int *stage) {
     // search replaced it). a.xy = 1 / the luminance's size, b.x = 1: motion vectors bound. (Every pixel of the search: 0.50
     // ms at 4K, the grid too small to fill the GPU; in steps of 2, 0.2.)
     // flow_refine.frag: again from the best of each block's and its 8 neighbours' results (spreading a good vector),
-    // then +-1 and +-0.5 pixel around it (bilinear: sub-pixel), against the analytic vector.
+    // then +-1 and +-0.5 pixel around it (bilinear: sub-pixel), against the analytic vector. Neither searches where
+    // the analytic vector's difference is 0.005 or less: nothing could win by the margin (the same result) - most of
+    // the ground and the background.
     if (!strcmp(name, "flow_match.frag") || !strcmp(name, "flow_refine.frag")) {
         *stage = STAGE_FRAGMENT;
         static const char *common =
@@ -1137,6 +1496,7 @@ static const char *builtin_src(const char *name, int *stage) {
                      "  prep(c);\n"
                      "  vec2 va = va_at(c), best = va;\n"
                      "  float sa = sad(c, va), sb = sa, s;\n"
+                     "  if (sa <= 0.005) { o = vec4(va / lsz, va / lsz); return; }\n"
                      "  int R = int(pc.a.z);\n"
                      "  vec2 v0 = floor(va + 0.5);\n"
                      "  for (int y = -R; y <= R; y += 2)\n"
@@ -1162,6 +1522,7 @@ static const char *builtin_src(const char *name, int *stage) {
                      "  prep(c);\n"
                      "  vec2 va = va_at(c), best = va;\n"
                      "  float sa = sad(c, va), sb = sa, s;\n"
+                     "  if (sa <= 0.005) { o = vec4(va / lsz, va / lsz); return; }\n"
                      "  for (int y = -1; y <= 1; y++)\n"
                      "    for (int x = -1; x <= 1; x++) {\n"
                      "      vec2 v = texelFetch(F, clamp(g + ivec2(x, y), ivec2(0), gs - 1), 0).xy * lsz;\n"
@@ -1296,23 +1657,25 @@ static const char *builtin_src(const char *name, int *stage) {
     if (!strcmp(name, "flow_warp.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"
-               "layout(set = 0, binding = 0) uniform sampler2D c0;\n"
-               "layout(set = 0, binding = 1) uniform sampler2D c1;\n"
+               // (the colours in half precision - mediump: the images are 8-bit, its error ~1/2000; the positions in full)
+               "layout(set = 0, binding = 0) uniform mediump sampler2D c0;\n"
+               "layout(set = 0, binding = 1) uniform mediump sampler2D c1;\n"
                "layout(set = 0, binding = 2) uniform sampler2D fn;\n"
                "layout(set = 0, binding = 3) uniform sampler2D dn;\n"
                "layout(set = 0, binding = 4) uniform sampler2D fp;\n"
                "layout(set = 0, binding = 5) uniform sampler2D m;\n"
                "layout(push_constant) uniform P { vec4 a; vec4 b; vec4 c; } pc;\n"
                "layout(location = 0) out vec4 o;\n"
-               "vec3 cr(sampler2D h, vec2 uv) {\n"
-               "  vec2 sz = vec2(textureSize(h, 0)), p = uv * sz, c1 = floor(p - 0.5) + 0.5, f = p - c1;\n"
-               "  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);\n"
-               "  vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);\n"
-               "  vec2 w12 = w1 + w2, t0 = (c1 - 1.0) / sz, t3 = (c1 + 2.0) / sz, t12 = (c1 + w2 / w12) / sz;\n"
-               "  vec3 r = texture(h, vec2(t12.x, t0.y)).rgb * w12.x * w0.y + texture(h, vec2(t0.x, t12.y)).rgb * w0.x * w12.y\n"
+               "mediump vec3 cr(mediump sampler2D h, vec2 uv) {\n"
+               "  vec2 sz = vec2(textureSize(h, 0)), p = uv * sz, c1 = floor(p - 0.5) + 0.5;\n"
+               "  mediump vec2 f = p - c1;\n"
+               "  mediump vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);\n"
+               "  mediump vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f), w12 = w1 + w2;\n"
+               "  vec2 t0 = (c1 - 1.0) / sz, t3 = (c1 + 2.0) / sz, t12 = (c1 + w2 / w12) / sz;\n"
+               "  mediump vec3 r = texture(h, vec2(t12.x, t0.y)).rgb * w12.x * w0.y + texture(h, vec2(t0.x, t12.y)).rgb * w0.x * w12.y\n"
                "         + texture(h, t12).rgb * w12.x * w12.y + texture(h, vec2(t3.x, t12.y)).rgb * w3.x * w12.y\n"
                "         + texture(h, vec2(t12.x, t3.y)).rgb * w12.x * w3.y;\n"
-               "  float ws = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;\n"
+               "  mediump float ws = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;\n"
                "  return clamp(r / ws, 0.0, 1.0);\n"
                "}\n"
                "vec4 at(sampler2D s, vec2 uv) { ivec2 z = textureSize(s, 0); return texelFetch(s, clamp(ivec2(uv * vec2(z)), ivec2(0), z - 1), 0); }\n"
@@ -1333,7 +1696,7 @@ static const char *builtin_src(const char *name, int *stage) {
                "    vec2 e = (q + (1.0 - t) * g.xy - c) * fs;\n"
                "    if (dot(e, e) < 2.25 && inside(c) && (!found || g.z < f.z)) { found = true; p = c; f = g; }\n"
                "  }\n"
-               "  vec3 col, dbg = vec3(0.0);\n"
+               "  mediump vec3 col, dbg = vec3(0.0);\n"
                "  if (found) {\n"
                "    vec2 r = p - f.xy;\n"
                "    bool ok0 = inside(r);\n"
@@ -1343,7 +1706,7 @@ static const char *builtin_src(const char *name, int *stage) {
                "      vec4 g = at(fp, r);\n"
                "      if (g.w < 0.0 || (pc.a.w > 0.5 && g.z < f.z * w * 0.94)) ok0 = false;\n"
                "    }\n"
-               "    vec3 n1 = cr(c1, p);\n"
+               "    mediump vec3 n1 = cr(c1, p);\n"
                "    col = ok0 ? mix(cr(c0, r), n1, t) : n1;\n"
                "    if (!ok0) dbg.g = 1.0;\n"
                "  } else {\n"

@@ -22,6 +22,7 @@ from lifter import Insn, Lifter, Unsupported, bits, emit_asm_batch, hx, sext
 from nso import Nso, R_AARCH64_RELATIVE
 
 SCRATCH_MEM = 0x7300000000
+CANONICAL_MAIN = 0x7000000000  # main's base in the canonical layout (runtime/rt.h), the one tools/patches.py is written for
 
 
 def sext26(w):
@@ -516,6 +517,11 @@ def main():
         PATCHES.clear()
         PATCHES.update(moved)
         RANDO_CODE.clear()
+    if args.name == 'main' and args.base != CANONICAL_MAIN:
+        # (written for the main at its canonical base, runtime/rt.h: moved with the guest window, GUEST_LO)
+        moved = {a - CANONICAL_MAIN + args.base: fn for a, fn in PATCHES.items()}
+        PATCHES.clear()
+        PATCHES.update(moved)
     starts = m.boundaries()
     hle = {}
     if args.hle and os.path.exists(args.hle):

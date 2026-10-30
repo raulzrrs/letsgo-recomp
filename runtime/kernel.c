@@ -747,6 +747,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     case 0x01: {  // SetHeapSize
         uint64_t size = x[1];
         if (size > HEAP_MAX) { x[0] = R_OUT_OF_RESOURCE; break; }
+        if (size && !heap_size) { extern uint64_t renderer_share_heap(uint64_t, uint64_t); renderer_share_heap(HEAP_BASE, size); }  // (Android: the GPU's view of it, before use)
         heap_size = size;
         region_remove(HEAP_BASE);
         if (size) region_add(HEAP_BASE, size, 5, 3);
