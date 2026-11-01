@@ -117,6 +117,9 @@ começar com o turno do selvagem (normalmente só depois de uma bola que estouro
 | `LARECOMP_FRAME_FINISH=1` | com a thread de renderização, o `nvnQueueFinish` do laço de quadros do jogo (o que ele chama quando mediu menos de 4 ms de GPU no quadro anterior) volta a esperar a fila e a GPU; sem ela segue o caminho do próprio jogo com GPU lenta (HISTORICO, "o Finish de cada quadro") |
 | `LARECOMP_VK_COPY_WAIT=1` | as cópias de buffer do jogo (`CopyBufferToBuffer`) voltam a esperar a GPU sempre (antes da 0.5.1 era assim); sem ela, só esperam quando a GPU escreve a origem ou o destino, ou lê o destino direto da memória |
 | `LARECOMP_LOG_B2B=1` | as 60 primeiras cópias de buffer: origem, destino, tamanho e se esperaram a GPU (`[b2b]`) |
+| `LARECOMP_LOG_GPUREADS=1` | loga cada faixa de memória que um shader de memória global pode ler (storage buffers ligados) |
+| `LARECOMP_VK_NO_GMEM=1` / `LARECOMP_VK_GMEM_MAX_MB=<n>` | sem a importação do heap (o texto do jogo some, issue #49) / recusa importações maiores que n MB, como um driver faria |
+| `LARECOMP_NO_BRA_IF=1` | todo BRA passa pelo `switch` do shader, sem virar `if` (issue #24) |
 | `LARECOMP_LOG_GPUWRITES=1` | loga cada faixa de memória que um compute pode escrever (storage buffers ligados) ao entrar no conjunto |
 | `LARECOMP_HLE_WHO=<endereço falso, hex>[,...]` | no boot, imprime o nome da função do host por trás de um endereço `0x70800000xx` visto num `LARECOMP_THREAD_DUMP` |
 | `LARECOMP_LOCK_SPIN_US=<n>` | quanto uma thread espera girando por um mutex contendido antes de dormir (padrão 40; 0 = sempre dorme, como antes; desligado com menos de 4 processadores lógicos). Para comparar antes/depois no mesmo binário |

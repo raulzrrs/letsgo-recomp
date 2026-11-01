@@ -1,9 +1,18 @@
 # Changelog
 
-## 0.7.6 (2026-10-25)
+## 0.7.6 (2026-11-01)
 
-- **Fix: the game froze after a long session** (issues #21, #33, #35): two of the renderer's tables were fixed in size;
+- **Fix: the game froze after a long session** (issues #21, #33, #35, #51): two of the renderer's tables were fixed in size;
   once the pipeline one filled, the render thread spun for good. They now grow.
+- **Fix: blank dialogue and menu text** when the graphics driver refused to share all of the game's memory (issue #49):
+  the game now shares less, down to what the driver accepts. Drivers that accept under about 1.7 GB still show no text;
+  the log now says what the driver answered. Tested by simulating the refusal, not on an affected PC.
+- **Fix: the GPU hanging in a battle on NVIDIA** (issue #24): a change to how shaders branch, by
+  [steve-spiteri](https://github.com/steve-spiteri), brought here and tested by [Sunrase](https://github.com/Sunrase).
+- **Incomplete game data is caught at setup** (issue #37): an image with files missing closed the game at start; the
+  start screen now says so and asks for the game folder again.
+- The name entry's font is prepared when the game starts, not when it first opens (it crashed there on an Intel HD 620,
+  issue #53; not tested on that card).
 - **Fix: "Make the 2x images" could sit there for good** on an AMD integrated GPU (issue #30): with no new image for 3
   minutes it stops and says the upscaler doesn't work on that card (the game plays the same without it).
 - **Show FPS** on the Graphics page (launcher and F12): the frame rate counter in a corner (issue #34).

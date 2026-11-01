@@ -876,3 +876,39 @@ Pedido: capturar a qualquer momento da batalha, mais fácil com o selvagem fraco
 ## Issue #34: mostrar o FPS pelo menu (25/10/2026)
 - O contador já existia (`show_fps` no `larecomp.ini`, `runtime/ui/menu.mm`), sem opção na interface. Agora é "Mostrar
   FPS" na página Gráficos (launcher e F12).
+
+## Issues #49 / #50: texto em branco depois da escolha de idioma (01/11/2026)
+- **Relatos.** #49 (Pikachu, Intel UHD): depois do idioma, diálogos e menus sem texto; o log traz "guest heap import
+  failed (3220 MB)". #50 (Pikachu, RTX 3050): o mesmo sintoma, sem log anexado: a causa dela não está confirmada.
+- **Reprodução.** `LARECOMP_VK_NO_GMEM=1` numa RTX 3080 dá a mesma imagem: caixas vazias, só o nome do idioma visível. O
+  texto é desenhado a partir de storage buffers (LDG), medidos (`LARECOMP_LOG_GPUREADS=1`) entre 1411 e 1653 MB dentro do
+  heap. Sem a importação, essas leituras voltam zero.
+- **Correção** (`runtime/nvn/vulkan/exec.c`, `gmem_info`). Recusados os 3220 MB, tenta menos, de 256 em 256 MB, até 512 MB.
+  `LARECOMP_VK_GMEM_MAX_MB=<n>` simula o limite: 2048 mostra o texto, 1024 não (nos dois casos a imagem bate com a medição).
+  **Limite:** um driver que só aceite menos de ~1,7 GB continua sem texto. O log agora dá o `VkResult`, o tamanho do heap
+  de memória, a maior alocação e o alcance de storage buffer. Não testado numa Intel UHD real.
+
+## Issue #24: a GPU travava num shader de batalha na NVIDIA (01/11/2026)
+- **Correção de @steve-spiteri para o smm2recomp, trazida por @Sunrase**, que a testou aqui: o travamento sumiu na máquina
+  dele. Um BRA condicional para a frente, sobre um trecho sem outro rótulo, vira `if` em vez de passar pelo `switch`
+  (`runtime/nvn/maxwell/translate.c`). Acrescentado: alvo em palavra de escalonamento não vira `if` (o bloco não fecharia).
+  `LARECOMP_NO_BRA_IF=1` desliga.
+- **Regressão.** Bateria `mundo` no Eevee, 3 + 3 rodadas com cache aquecido: antes x depois = 0,97 de diferença média de
+  luma, igual ao ruído entre rodadas da mesma build (1,08 / 0,95); blinks 22-25 nas duas. A primeira rodada, com cache
+  frio, deu uma diferença enorme que não se repetiu. O travamento em si não reproduz na RTX 3080.
+
+## Issue #37: o jogo fechava no início por faltar arquivos (01/11/2026)
+- **Log.** `romfs index: 19165 files`; todos os outros logs e as três imagens contadas (Eevee 1.0.0 e 1.0.2, Pikachu 1.0.0)
+  têm 27818. O crash é em `nn::fs::detail::FileAccessor::Read` com ponteiro nulo: o jogo lê um arquivo cuja abertura falhou.
+  O relato diz que a 0.7.1 funciona; isso não foi explicado.
+- **Correção** (`romfs_image_ok`, `runtime/romfs_build.c`). Menos de 27000 arquivos na tabela da imagem: a configuração
+  recusa e pede a pasta do jogo de novo, como na imagem ilegível da issue #31.
+
+## Issue #53: crash ao abrir a entrada do nome numa Intel HD 620 (01/11/2026)
+- **Log.** `c0000005` no `igvk64.dll`, vindo de `vkBindImageMemory` em `ImGui_ImplVulkan_CreateFontsTexture`
+  (símbolos da 0.7.5), no primeiro desenho do teclado. Hipótese não provada: a alocação anterior falhou por falta de memória
+  e o backend do ImGui seguiu com a memória nula.
+- **Mitigação** (`runtime/ui/menu.mm`). A textura das fontes é criada no primeiro quadro, antes de o jogo ocupar a memória, e
+  o ImGui agora registra as chamadas Vulkan que falham. Não testado na placa do relato.
+- **#52 (Radeon integrada), mesmo momento do jogo, outra assinatura:** falha de GPU lendo o endereço 0 logo depois das
+  primeiras imagens intermediárias de menu. A 0.7.6 tirou essas imagens dos menus, mas a ligação é hipótese.
