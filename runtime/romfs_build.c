@@ -20,6 +20,8 @@
 #include <windows.h>
 #endif
 
+#define ROMFS_GAME_FILES 27818  // (Eevee 1.0.0 and 1.0.2, Pikachu 1.0.0: counted)
+#define ROMFS_MIN_FILES 27000
 #define EMPTY 0xFFFFFFFFu
 #define DATA_START 0x200u
 
@@ -323,6 +325,20 @@ bool romfs_image_ok(const char *path, char *why, size_t why_size) {
             return false;
         }
     if (h[9] > size) { snprintf(why, why_size, "its data starts past its end (%llu bytes)", (unsigned long long)size); return false; }
+    // Files missing: the game reads a file whose open failed, without checking, and closes (issue #37: 19165 files; the
+    // whole game has 27818). The file table's entries: parent, sibling (u32), offset, size (u64), hash, name length (u32), name.
+    uint8_t *meta = malloc(h[8]);
+    f = meta ? fopen(path, "rb") : NULL;
+    bool got = f && fseeko(f, (off_t)h[7], SEEK_SET) == 0 && fread(meta, 1, h[8], f) == h[8];
+    if (f) fclose(f);
+    int nfiles = 0;
+    for (uint64_t o = 0; got && o + 0x20 <= h[8]; nfiles++) {
+        uint32_t len;
+        memcpy(&len, meta + o + 0x1C, 4);
+        o += 0x20 + ((len + 3ull) & ~3ull);
+    }
+    free(meta);
+    if (got && nfiles < ROMFS_MIN_FILES) { snprintf(why, why_size, "only %d files: the game has %d", nfiles, ROMFS_GAME_FILES); return false; }
     return true;
 }
 
