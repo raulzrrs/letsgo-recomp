@@ -577,11 +577,16 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     bool open = g_open.load(), cfg = g_cfg.load(), kbd = g_kbd.load() == 1;
     float fx, fy;
     bool fdown, finger = !open && !cfg && input_finger_cursor(&fx, &fy, &fdown);
+    // At the first frame, not when the name entry first opens: by then the game has taken its memory, and on the small
+    // integrated GPU of issue #53 the fonts' texture crashed the driver there, in vkBindImageMemory.
+    if (!g_inited) {
+        init();
+        ImGui_ImplVulkan_CreateFontsTexture();
+    }
     if (!open && !cfg && !kbd && !g_settings.show_fps && !finger) {
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
         return;
     }
-    if (!g_inited) init();
     ImGui::SetCurrentContext(g_ctx);
     ImGuiIO &io = ImGui::GetIO();
     io.DisplaySize = ImVec2((float)target_w, (float)target_h);

@@ -27,6 +27,7 @@ extern "C" bool vk_imgui_backend_init(void) {
     ii.PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
     ii.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
     ii.PipelineRenderingCreateInfo.pColorAttachmentFormats = &g_vk.sc_format;
+    ii.CheckVkResultFn = [](VkResult err) { if (err < 0) LOG("[vk] ImGui: Vulkan call failed: %d\n", err); };
     bool ok = ImGui_ImplVulkan_Init(&ii);
     if (!ok) LOG("[vk] ImGui Vulkan backend init failed\n");
     return ok;
