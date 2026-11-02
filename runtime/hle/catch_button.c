@@ -557,6 +557,8 @@ static void set_strs(FVal *v, const char *s) {
     free(v->strs);
     v->strs = malloc(sizeof *v->strs), v->strs[0] = strdup(s), v->nstrs = 1;
 }
+// glibc declares clone() (sched.h, _GNU_SOURCE): this file's own static one has another name
+#define clone catch_button_clone
 static FTable clone(FTable *t) {  // (deep: the strings are its own)
     FTable c = *t;
     for (int i = 0; i < c.n; i++) {

@@ -1,6 +1,6 @@
 # Let's Go Recomp build (from LAS Recomp's).
 # Windows (the supported platform): MSYS2 UCRT64 shell or Git Bash with MSYS2 on PATH, clang + Vulkan renderer
-# (docs/COMPILAR-WINDOWS.md). The Linux branch is LAS Recomp's, kept but untested here.
+# (docs/COMPILAR-WINDOWS.md). The Linux branch is LAS Recomp's; it builds and runs (docs/LINUX.md).
 #   make gen           translate your own game files (extracted/exefs) into generated/
 #   make -j20          build/lasrecomp.exe (runtime) and build/lasgame.dll (the game code)
 #   make jogo          a copy to play while build/ is rebuilt (build/jogo/)
@@ -59,7 +59,7 @@ ifeq ($(ARCH),x86_64)
 GENARCH  ?= -march=x86-64-v3  # as on Windows (see there)
 endif
 GENFLAGS += $(GENARCH) -fPIC
-OSFLAGS  := -Wno-format  # (%llx for uint64_t, which is unsigned long here: the same size)
+OSFLAGS  := -Wno-format -fdeclspec -DRT_APP_NAME=\"LetsGoRecomp\" -D_GNU_SOURCE  # (%llx for uint64_t, which is unsigned long here: the same size; -fdeclspec: FidelityFX's headers)
 SHADERC  ?= -lshaderc  # (Debian / Ubuntu's libshaderc.so; a shaderc built from source: -lshaderc_shared)
 # -rdynamic: crash backtraces name host functions (runtime/platform/linux.c)
 LDFLAGS  := -fuse-ld=lld -rdynamic $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
