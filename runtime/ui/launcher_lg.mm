@@ -231,11 +231,11 @@ static void game_files_section(SDL_Window *win) {
                                          "A imagem de dados do jogo (romfs.bin) não pode ser lida."};
         static const char *const en_h[] = {"Choose the folder that holds exefs and romfs.", "Extract them first (exefs and romfs).",
                                            "Pick the folder of your own extracted Let's Go, Eevee! or Pikachu!.", "Check there are about 6 GB free and try again.",
-                                           "Check there are about 2 GB free and try again; details in lasrecomp.log.", "Download the release again.",
+                                           "Try again (it needs about 2 GB free); if it fails again, lasrecomp.log says which step failed: attach it to an issue.", "Download the release again.",
                                            "Pick the folder with the romfs folder itself (not a romfs.bin from another tool); details in lasrecomp.log."};
         static const char *const pt_h[] = {"Escolha a pasta que tem exefs e romfs.", "Extraia antes (exefs e romfs).",
                                            "Escolha a pasta do seu Let's Go, Eevee! ou Pikachu! extraído.", "Confira se há uns 6 GB livres e tente de novo.",
-                                           "Confira se há uns 2 GB livres e tente de novo; detalhes no lasrecomp.log.", "Baixe a release de novo.",
+                                           "Tente de novo (precisa de uns 2 GB livres); se falhar de novo, o lasrecomp.log diz qual etapa falhou: anexe-o a uma issue.", "Baixe a release de novo.",
                                            "Escolha a pasta com a própria pasta romfs (não um romfs.bin de outra ferramenta); detalhes no lasrecomp.log."};
         int k = st - SETUP_FAIL_NOT_FOUND;
         ImGui::TextColored(k_red, "%s", T(en[k], pt[k]));

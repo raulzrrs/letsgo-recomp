@@ -209,6 +209,22 @@ static void log_tail(const char *path, char *out, size_t n) {  // the last line 
     snprintf(out, n, "%s", nl ? nl + 1 : buf);
 }
 
+// The end of a failed tool's log, every line into ours: a Python traceback (the generator) ends with its last line,
+// the exception, but where it came from is the lines above it.
+static void log_tail_all(const char *path, const char *who) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    char buf[6144];
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, size > (long)sizeof buf - 1 ? size - (long)sizeof buf + 1 : 0, SEEK_SET);
+    size_t k = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[k] = 0;
+    for (char *l = strtok(buf, "\r\n"); l; l = strtok(NULL, "\r\n"))
+        if (!strstr(l, ": progress ")) LOG("[gamebuild]   %s| %s\n", who, l);
+}
+
 // ------------------------------------------------------------------ compiling
 typedef struct {
     char src[1100], obj[1100], log[1100];
@@ -356,7 +372,8 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
                     if (r != 0) {
                         char last[300];
                         log_tail(g->log, last, sizeof last);
-                        LOG("[gamebuild] generator (%s) failed: %s\n", g->name, last);
+                        LOG("[gamebuild] generator (%s) failed (exit %d): %s\n", g->name, r, last);
+                        log_tail_all(g->log, g->name);
                         snprintf(why, why_size, "the game code couldn't be prepared");
                         ok = false;
                     }

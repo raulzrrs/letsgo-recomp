@@ -912,3 +912,11 @@ Pedido: capturar a qualquer momento da batalha, mais fácil com o selvagem fraco
   o ImGui agora registra as chamadas Vulkan que falham. Não testado na placa do relato.
 - **#52 (Radeon integrada), mesmo momento do jogo, outra assinatura:** falha de GPU lendo o endereço 0 logo depois das
   primeiras imagens intermediárias de menu. A 0.7.6 tirou essas imagens dos menus, mas a ligação é hipótese.
+
+## Issue #54: "o código do jogo não compilou" com espaço livre (04/11/2026)
+- **Log.** `generator (subsdk1) failed: [PYI-9652:ERROR] Failed to execute script 'gen' due to unhandled exception!`
+  (GTX 1060, atualizando da 0.7.5 para a 0.7.6). O launcher dizia "confira se há uns 2 GB livres", e o autor tinha espaço.
+- **O que se achou.** O `lasgen.exe` da 0.7.6 gera o `subsdk1` do Eevee e do Pikachu 1.0.0 sem erro aqui (142 chunks).
+  O log só guardava a última linha do log do gerador; o traceback do Python, que diz onde quebrou, ficava de fora.
+- **Mudança.** Gerador que falha copia o fim do seu log inteiro para o `lasrecomp.log` (`log_tail_all`, com o código de
+  saída); o aviso do launcher não culpa mais o espaço em disco e pede o log. A causa depende do traceback do autor.
