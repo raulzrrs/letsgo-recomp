@@ -7,6 +7,9 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
