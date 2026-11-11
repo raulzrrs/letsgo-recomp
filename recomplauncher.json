@@ -1,0 +1,146 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "Let's Go Recomp",
+  "repo": "raulzrrs/letsgo-recomp",
+  "game": {
+    "kind": "folder",
+    "label": "Your extracted copy of Pokémon: Let's Go, Eevee! or Pikachu!: the folder with exefs and romfs (.xci and .nsp files must be extracted first).",
+    "check": { "file": "exefs/main.npdm" }
+  },
+  "start": {
+    "program": ["LetsGoRecomp.exe"],
+    "args": ["--play", "--game", "{game}"]
+  },
+  "prepare": {
+    "program": ["LetsGoRecomp.exe"],
+    "args": ["--prepare", "--game", "{game}"],
+    "label": "Game files and game code for your PC",
+    "timeout": 7200
+  },
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": [{ "path": "{install}/larecomp.ini" }]
+    }
+  ],
+  "folders": {
+    "saves": [
+      { "path": "{install}/save-pikachu", "if": "{install}/save-pikachu" },
+      { "path": "{install}/save" }
+    ],
+    "logs": [{ "path": "{install}" }]
+  },
+  "saves": ["{install}/save", "{install}/save-pikachu"],
+  "settings": [
+    {
+      "id": "window", "label": "Window",
+      "help": "Fullscreen fills your screen when the game starts.",
+      "choices": [
+        { "label": "Windowed", "set": { "fullscreen": "0" } },
+        { "label": "Fullscreen", "set": { "fullscreen": "1" } }
+      ],
+      "defaults": { "fullscreen": "0" }
+    },
+    {
+      "id": "resolution", "label": "Resolution",
+      "help": "The height the game is drawn at. Automatic leaves it to the game's own Resolution option.",
+      "choices": [
+        { "label": "Automatic", "set": { "render_height": "0" } },
+        { "label": "720p", "set": { "render_height": "720" } },
+        { "label": "1080p", "set": { "render_height": "1080" } },
+        { "label": "1440p", "set": { "render_height": "1440" } },
+        { "label": "4K", "set": { "render_height": "2160" } }
+      ],
+      "defaults": { "render_height": "0" }
+    },
+    {
+      "id": "frame_rate", "label": "Frame rate",
+      "help": "30 is the game's own. 60 and 120 are experimental and only speed up the overworld: menus, battles and captures stay at 30, as on the console.",
+      "choices": [
+        { "label": "30", "set": { "fps": "30" } },
+        { "label": "60", "set": { "fps": "60" } },
+        { "label": "120", "set": { "fps": "120" } }
+      ],
+      "defaults": { "fps": "30" }
+    },
+    {
+      "id": "frame_generation", "label": "Frame generation",
+      "help": "Draws extra images between the game's frames for a smoother picture, on any graphics card. Auto picks as many as your screen shows evenly.",
+      "choices": [
+        { "label": "Off", "set": { "frame_gen": "0" } },
+        { "label": "Auto", "set": { "frame_gen": "auto" } },
+        { "label": "2x", "set": { "frame_gen": "2" } },
+        { "label": "3x", "set": { "frame_gen": "3" } },
+        { "label": "4x", "set": { "frame_gen": "4" } }
+      ],
+      "defaults": { "frame_gen": "0" }
+    },
+    {
+      "id": "anti_aliasing", "label": "Anti-aliasing",
+      "help": "Smooths jagged edges. SMAA is light, TAA is softer, AMD FSR 3.1 also upscales.",
+      "choices": [
+        { "label": "Off", "set": { "aa": "off" } },
+        { "label": "SMAA", "set": { "aa": "smaa" } },
+        { "label": "TAA", "set": { "aa": "taa" } },
+        { "label": "FSR 3.1", "set": { "aa": "fsr3" } }
+      ],
+      "defaults": { "aa": "smaa" }
+    },
+    {
+      "id": "ambient_occlusion", "label": "Ambient occlusion",
+      "help": "Soft shadows where surfaces meet. Ultra adds contact shadows. Costs graphics card power.",
+      "choices": [
+        { "label": "Off", "set": { "ssao_level": "0" } },
+        { "label": "Low", "set": { "ssao_level": "1" } },
+        { "label": "Medium", "set": { "ssao_level": "2" } },
+        { "label": "High", "set": { "ssao_level": "3" } },
+        { "label": "Ultra", "set": { "ssao_level": "4" } }
+      ],
+      "defaults": { "ssao_level": "0" }
+    },
+    {
+      "id": "indirect_light", "label": "Indirect light",
+      "help": "Light that bounces off surfaces. Costs graphics card power.",
+      "choices": [
+        { "label": "Off", "set": { "gi_level": "0" } },
+        { "label": "Low", "set": { "gi_level": "1" } },
+        { "label": "Medium", "set": { "gi_level": "2" } },
+        { "label": "High", "set": { "gi_level": "3" } }
+      ],
+      "defaults": { "gi_level": "0" }
+    },
+    {
+      "id": "fps_counter", "label": "Show FPS",
+      "help": "The frame rate in a corner of the game.",
+      "choices": [
+        { "label": "Off", "set": { "show_fps": "0" } },
+        { "label": "On", "set": { "show_fps": "1" } }
+      ],
+      "defaults": { "show_fps": "0" }
+    },
+    {
+      "id": "wild_battles", "label": "Wild battles (experimental)",
+      "help": "Touching a wild Pokémon starts a classic battle before the capture. Needs Eevee 1.0.0 or 1.0.2, or Pikachu 1.0.0.",
+      "choices": [
+        { "label": "Off", "set": { "wild_battle": "0" } },
+        { "label": "On", "set": { "wild_battle": "1" } }
+      ],
+      "defaults": { "wild_battle": "0" }
+    },
+    {
+      "id": "skip_controller", "label": "Skip controller selection",
+      "help": "Starts at the Game Freak logo with your controller already chosen. Needs Eevee 1.0.0 or 1.0.2, or Pikachu 1.0.0.",
+      "choices": [
+        { "label": "Off", "set": { "skip_controller": "0" } },
+        { "label": "On", "set": { "skip_controller": "1" } }
+      ],
+      "defaults": { "skip_controller": "0" }
+    }
+  ],
+  "actions": [
+    { "id": "saves", "label": "Saves", "help": "Your save files.", "open": "saves" },
+    { "id": "logs", "label": "Log", "help": "lasrecomp.log, to attach to a bug report.", "open": "logs" }
+  ]
+}
