@@ -267,3 +267,32 @@ void setup_start(const char *folder) {
     pthread_create(&t, NULL, setup_thread, NULL);
     pthread_detach(t);
 }
+
+static const char *step_text(int state) {
+    switch (state) {
+    case SETUP_LOOKING: return "Looking for the game files";
+    case SETUP_COPYING: return "Copying the game files";
+    case SETUP_IMAGE: return "Building the game data";
+    case SETUP_READING: return "Reading the game code";
+    case SETUP_COMPILING: return "Compiling the game code";
+    default: return "Finishing";
+    }
+}
+
+// The start screen's setup without its window, for a launcher (--prepare --game <folder>, runtime/main.c): it reports
+// "progress <0 to 1> <step>" lines on stdout. Returns 0 when the game is ready, else the SETUP_FAIL_* state.
+int setup_prepare(const char *folder) {
+    setup_start(setup_needs_build() ? NULL : folder);
+    int shown_pct = -1, shown_state = -1;
+    while (setup_running()) {
+        int state = g_state, pct = (int)(g_progress * 100);
+        if (pct != shown_pct || state != shown_state) {
+            printf("progress %.2f %s\n", pct / 100.0, step_text(state));
+            fflush(stdout);
+            shown_pct = pct, shown_state = state;
+        }
+        SDL_Delay(500);
+    }
+    int state = setup_state();
+    return state == SETUP_DONE ? 0 : state;
+}
