@@ -18,6 +18,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <stdarg.h>
+#include <sys/syscall.h>
+
 #include "../paths.h"
 #include "../platform.h"
 
@@ -33,13 +36,20 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
     if (p == MAP_FAILED) return false;
     if (p != (void *)(uintptr_t)lo) { munmap(p, hi - lo); return false; }  // (kernels before 4.17: just a hint)
+    // Huge pages where the kernel makes them (THP is in "madvise" mode on Fedora): the guest heap is imported for the
+    // GPU (VK_EXT_external_memory_host) and the driver walks its pages on every command submission - 28 ms of CPU for
+    // the 3.4 GB heap with 4 KB pages, twice a frame, which halves the frame rate and starves the game's audio (issue
+    // #10). With 2 MB pages the same walk covers 512 times fewer entries.
+    madvise(p, hi - lo, MADV_HUGEPAGE);
     return true;
 }
 
 // Fresh zero pages over the whole window (the old ones are released at once).
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
-    return mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
-                -1, 0) == (void *)(uintptr_t)lo;
+    void *p = mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+    if (p == (void *)(uintptr_t)lo) madvise(p, hi - lo, MADV_HUGEPAGE);  // (a new mapping: the advice does not carry over)
+    return p == (void *)(uintptr_t)lo;
 }
 
 void plat_commit(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
