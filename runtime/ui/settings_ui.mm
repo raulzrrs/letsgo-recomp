@@ -12,6 +12,7 @@
 extern "C" {
 #include "../paths.h"
 #include "../settings.h"
+bool fsr3_available(void);  // (runtime/nvn/vulkan/fsr3.cpp: false where AMD's DLL is not there)
 }
 
 // ------------------------------------------------------------------ language
@@ -568,15 +569,20 @@ void ui_page_graphics(float x, bool known) {
     // upscaling too, with its mode below. With the others a lower internal resolution is scaled bilinearly
     // (settings_apply_levels).
     {
-        const char *aa[] = {UI_T("Off", "Desligado", "Выкл."), "SMAA", "TAA", "FSR 3.1"};
+        bool fsr3 = fsr3_available();  // (false where AMD's DLL is not there: runtime/nvn/vulkan/fsr3.cpp)
+        const char *aa[] = {UI_T("Off", "Desligado", "Выкл."), "SMAA", "TAA",
+                            fsr3 ? "FSR 3.1" : UI_T("FSR 1 (upscale)", "FSR 1 (ampliação)", "FSR 1 (увеличение)")};
         ui_row(l[4], x);
         if (ui_combo("##aa", &g_settings.antialias, aa, 4)) settings_apply_levels();
-        ui_tip(UI_T("Smooths jagged edges. SMAA: light, on the final image. TAA and FSR 3.1: steadier, over several frames; FSR 3.1 also draws the scene at a lower resolution and upscales it.",
-                    "Suaviza os serrilhados. SMAA: leve, na imagem final. TAA e FSR 3.1: mais estáveis, ao longo de vários quadros; o FSR 3.1 também desenha a cena numa resolução menor e a amplia.",
-                    "Сглаживает зубчатые края. SMAA: лёгкое, на итоговом кадре. TAA и FSR 3.1: стабильнее, по нескольким кадрам; FSR 3.1 ещё и рисует сцену в меньшем разрешении и увеличивает её."));
+        ui_tip(fsr3 ? UI_T("Smooths jagged edges. SMAA: light, on the final image. TAA and FSR 3.1: steadier, over several frames; FSR 3.1 also draws the scene at a lower resolution and upscales it.",
+                           "Suaviza os serrilhados. SMAA: leve, na imagem final. TAA e FSR 3.1: mais estáveis, ao longo de vários quadros; o FSR 3.1 também desenha a cena numa resolução menor e a amplia.",
+                           "Сглаживает зубчатые края. SMAA: лёгкое, на итоговом кадре. TAA и FSR 3.1: стабильнее, по нескольким кадрам; FSR 3.1 ещё и рисует сцену в меньшем разрешении и увеличивает её.")
+                     : UI_T("Smooths jagged edges. SMAA: light, on the final image. TAA: steadier, over several frames. FSR 1: draws the scene at a lower resolution and upscales it.",
+                            "Suaviza os serrilhados. SMAA: leve, na imagem final. TAA: mais estável, ao longo de vários quadros. FSR 1: desenha a cena numa resolução menor e a amplia.",
+                            "Сглаживает зубчатые края. SMAA: лёгкое, на итоговом кадре. TAA: стабильнее, по нескольким кадрам. FSR 1: рисует сцену в меньшем разрешении и увеличивает её."));
     }
     // FSR 3.1's presets: the render resolution is the window's divided by the ratio (runtime/nvn/output_scale.c)
-    if (g_settings.antialias == AA_FSR3) {
+    if (fsr3_available() && g_settings.antialias == AA_FSR3) {
         const char *pr[] = {UI_T("Native AA (1.0x)", "AA nativo (1,0x)", "Нативное AA (1,0x)"),
                             UI_T("Quality (1.5x)", "Qualidade (1,5x)", "Качество (1,5x)"),
                             UI_T("Balanced (1.7x)", "Equilibrado (1,7x)", "Баланс (1,7x)"),
