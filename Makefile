@@ -56,7 +56,8 @@ ifeq ($(PLATFORM),linux)
 EXE      := $(B)/lasrecomp
 DEPINC   := $(if $(DEPS),-I$(DEPS)/include)
 ifeq ($(ARCH),x86_64)
-GENARCH  ?= -march=x86-64-v3  # as on Windows (see there)
+# The level of the machine that builds it, which is the one that runs it: v3 needs AVX2 (as on Windows, see there)
+GENARCH  ?= $(if $(shell grep -qw avx2 /proc/cpuinfo 2>/dev/null && echo y),-march=x86-64-v3,-march=x86-64-v2)
 endif
 GENFLAGS += $(GENARCH) -fPIC
 # The libraries' own flags: headers in a non-default place (Fedora's FFmpeg: /usr/include/ffmpeg) and the -l list
@@ -251,4 +252,10 @@ gen-helper:
 jogo:
 	tools/publicar_jogo.sh
 
-.PHONY: all gen gen-objs runtime-objs dist deps-windows gen-helper jogo
+# Linux: an AppImage, and a Steam entry that starts the game instead of the start screen (docs/COMPILAR-LINUX.md)
+appimage:
+	tools/make_appimage.sh
+steam:
+	tools/steam_shortcut.sh
+
+.PHONY: all gen gen-objs runtime-objs dist deps-windows gen-helper jogo appimage steam
