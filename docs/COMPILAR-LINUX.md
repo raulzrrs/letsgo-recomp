@@ -103,6 +103,10 @@ no path: it cannot go stale. An AppImage can be added to Steam the same way; giv
   Windows has it as `tar.exe`; on Linux install `bsdtar` (Fedora: `bsdtar`, Debian / Ubuntu: `libarchive-tools`). A
   plain `tar` is used when `bsdtar` is missing, which reads `.tar` / `.tgz` but not `.zip` / `.rar` / `.7z`.
   `LARECOMP_TAR=<program>` picks another.
+- **Huge pages:** the guest window is claimed with `MADV_HUGEPAGE`. The shader global memory is the game's heap
+  imported for the GPU, and the amdgpu driver re-walks that whole userptr range on every command submission: 28 ms per
+  submission with 4 KB pages (16.5 fps instead of 30, and the intro's audio dropped out every 170 ms), 2.2 ms with 2 MB
+  pages. `/proc/<pid>/smaps` shows the 3.3 GB in `AnonHugePages`; without it, look here first.
 - **Frame generation** paces without the display's vertical-blank grid (that timing is Windows' compositor's): each
   image is shown when it is due, which on a 240 Hz panel can space two of them one refresh instead of two apart.
 - **Fonts:** the game's font engine needs a TrueType font as a stand-in for the console's system fonts. In order:
