@@ -124,6 +124,14 @@ void rt_paths_init(void) {
 
 const char *rt_data_root(void) { return g_root; }
 
+#ifndef _WIN32
+const char *rt_tool(const char *const *cand) {
+    for (size_t i = 0; cand[i]; i++)
+        if (!access(cand[i], X_OK)) return cand[i];
+    return cand[0];
+}
+#endif
+
 bool rt_resource(const char *name, const char *dev_rel, char *out, size_t n) {
     char c[4][1100] = {{0}};
     if (name) {

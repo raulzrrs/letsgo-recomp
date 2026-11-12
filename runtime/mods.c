@@ -200,10 +200,8 @@ static void *install_thread(void *arg) {
         tar = sys_tar;
 #else
         // libarchive's tar, the same libarchive Windows' tar.exe is: bsdtar, else the plain tar (only .tar / .tgz)
-        static const char *const cand[] = {"/usr/bin/bsdtar", "/usr/bin/tar", "/bin/bsdtar", "/bin/tar"};
-        tar = cand[0];
-        for (size_t i = 0; i < sizeof cand / sizeof *cand; i++)
-            if (!access(cand[i], X_OK)) { tar = cand[i]; break; }
+        static const char *const cand[] = {"/usr/bin/bsdtar", "/usr/bin/tar", "/bin/bsdtar", "/bin/tar", NULL};
+        tar = rt_tool(cand);
 #endif
         const char *tarenv = getenv("LARECOMP_TAR");
         if (tarenv && *tarenv) tar = tarenv;

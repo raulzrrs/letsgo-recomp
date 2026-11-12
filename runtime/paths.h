@@ -28,6 +28,12 @@ void rt_paths_init(void);         // first thing in main(), after plat_init
 const char *rt_data_root(void);   // absolute
 bool rt_dev_mode(void);           // dev / portable mode (rule 2 above): e.g. a source checkout
 
+#ifndef _WIN32
+// The first of `cand` (NULL-terminated) that is an executable file, else cand[0]. Off Windows a spawned program is taken
+// as given and never looked up in PATH, and where a distribution puts tar / curl differs (/usr/bin against /bin).
+const char *rt_tool(const char *const *cand);
+#endif
+
 // A shipped file: `name` next to the executable or in Contents/Resources, else `dev_rel` in the source tree (the
 // starting directory or the executable's parent; NULL = shipped builds only). Absolute path in out; false = none.
 bool rt_resource(const char *name, const char *dev_rel, char *out, size_t n);
