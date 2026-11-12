@@ -724,6 +724,7 @@ static void present_image(TexBackend *b, bool final, int image, int nimg, uint64
         static char wpath[64];
         snprintf(wpath, sizeof wpath, "build/window_%s.png", mid);
         const char *path = shot ? (final ? "build/window.png" : wpath) : NULL;
+        if (path) mkdir("build", 0755);  // (an installed data root has no build/: the screenshots make it)
         for (int i = 0; i < nlist; i++)
             if (rel_list ? (fps60_scene_start() >= 0 && (long)frame + 1 - fps60_scene_start() == list[i])
                          : (long)frame + 1 == list[i]) {
@@ -874,7 +875,18 @@ double vk_display_hz(void) {
     }
     return hz;
 #else
-    return 0;
+    // SDL3's report of the display's current mode: the same number the Windows compositor's timing gives
+    static double hz;
+    static uint64_t at;
+    uint64_t now = SDL_GetTicksNS();
+    if (at && now - at < 1000000000ull) return hz;
+    at = now;
+    SDL_Window *ui_window(void);
+    SDL_Window *w = ui_window();
+    SDL_DisplayID d = w ? SDL_GetDisplayForWindow(w) : SDL_GetPrimaryDisplay();
+    const SDL_DisplayMode *m = d ? SDL_GetCurrentDisplayMode(d) : NULL;
+    hz = m && m->refresh_rate > 1 ? m->refresh_rate : 0;
+    return hz;
 #endif
 }
 

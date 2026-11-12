@@ -189,17 +189,34 @@ static void *install_thread(void *arg) {
     if (!name[0]) snprintf(name, sizeof name, "mod");
     mkdir("mods", 0755);
     const char *root = src;
-    if (!is_dir(src)) {  // an archive: Windows' own tar (libarchive: .zip, .rar, .7z) into mods/.install
+    if (!is_dir(src)) {  // an archive, unpacked into mods/.install: bsdtar on every OS (libarchive: .zip, .rar, .7z)
         rm_tree("mods/.install");
         mkdir("mods/.install", 0755);
-        char tar[600];
+        const char *tar;
+#ifdef _WIN32
+        char sys_tar[600];
         const char *sys = getenv("SystemRoot");
-        snprintf(tar, sizeof tar, "%s\\System32\\tar.exe", sys ? sys : "C:\\Windows");
+        snprintf(sys_tar, sizeof sys_tar, "%s\\System32\\tar.exe", sys ? sys : "C:\\Windows");  // (Windows' own bsdtar)
+        tar = sys_tar;
+#else
+        // libarchive's tar, the same libarchive Windows' tar.exe is: bsdtar, else the plain tar (only .tar / .tgz)
+        static const char *const cand[] = {"/usr/bin/bsdtar", "/usr/bin/tar", "/bin/bsdtar", "/bin/tar"};
+        tar = cand[0];
+        for (size_t i = 0; i < sizeof cand / sizeof *cand; i++)
+            if (!access(cand[i], X_OK)) { tar = cand[i]; break; }
+#endif
+        const char *tarenv = getenv("LARECOMP_TAR");
+        if (tarenv && *tarenv) tar = tarenv;
         const char *argv[] = {tar, "-xf", src, "-C", "mods/.install", NULL};
         PlatProc p = plat_spawn(argv, "mods/.install.log", false);
         int r = p ? plat_proc_wait(p, true) : -1;
         remove("mods/.install.log");
-        if (r != 0) { LOG("[mods] couldn't unpack %s (tar %d)\n", src, r); g_install_state = MOD_INSTALL_FAIL_UNPACK; goto done; }
+        if (r != 0) {
+            LOG("[mods] couldn't unpack %s (%s %d): bsdtar installs with libarchive (Fedora: bsdtar, Debian: "
+                "libarchive-tools)\n", src, tar, r);
+            g_install_state = MOD_INSTALL_FAIL_UNPACK;
+            goto done;
+        }
         root = "mods/.install";
     }
     {
