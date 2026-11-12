@@ -59,15 +59,20 @@ ifeq ($(ARCH),x86_64)
 GENARCH  ?= -march=x86-64-v3  # as on Windows (see there)
 endif
 GENFLAGS += $(GENARCH) -fPIC
-OSFLAGS  := -Wno-format  # (%llx for uint64_t, which is unsigned long here: the same size)
-SHADERC  ?= -lshaderc  # (Debian / Ubuntu's libshaderc.so; a shaderc built from source: -lshaderc_shared)
+# The libraries' own flags: headers in a non-default place (Fedora's FFmpeg: /usr/include/ffmpeg) and the -l list
+# (a cross build passes the target's PKG_CONFIG_LIBDIR)
+PKGS     := sdl3 libavformat libavcodec libavutil libswscale vulkan
+PKGINC   := $(shell pkg-config --cflags $(PKGS) 2>/dev/null)
+OSFLAGS  := $(PKGINC) -Wno-format  # (%llx for uint64_t, which is unsigned long here: the same size)
+# shaderc.pc names the library (libshaderc.so on Debian / Ubuntu, libshaderc_shared.so elsewhere)
+SHADERC  ?= $(shell pkg-config --libs shaderc 2>/dev/null || echo -lshaderc)
 # -rdynamic: crash backtraces name host functions (runtime/platform/linux.c)
-LDFLAGS  := -fuse-ld=lld -rdynamic $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
-            -lvulkan $(SHADERC) -lpthread -ldl -lm
+LDFLAGS  := -fuse-ld=lld -rdynamic $(if $(DEPS),-L$(DEPS)/lib) $(shell pkg-config --libs $(PKGS) 2>/dev/null) \
+            $(SHADERC) -lpthread -ldl -lm
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
 IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o
-UIFLAGS  := -x c++  # the .mm UI sources are plain C++
+UIFLAGS  := -x c++ $(OSFLAGS)  # the .mm UI sources are plain C++
 GAMELIB  := $(B)/lasgame.so
 GAMELIB_LDFLAGS := -shared -fuse-ld=lld  # (the runtime functions it calls: the app's own, -rdynamic)
 GAMELIB_SHARED := -shared

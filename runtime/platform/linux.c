@@ -18,6 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../paths.h"
 #include "../platform.h"
 
 #ifndef MAP_FIXED_NOREPLACE
