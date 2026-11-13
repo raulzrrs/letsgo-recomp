@@ -45,8 +45,38 @@ static bool steam_root(char *out, size_t n) {
     return false;
 }
 
-// <root>/userdata/<account>/config: the account with the most recently written shortcuts.vdf, else the first one
+// The account Steam starts by itself: config/loginusers.vdf holds a block per account, and the one with AutoLogin "1"
+// is that account. Its userdata directory is the account id: the SteamID64 less 76561197960265728.
+static bool steam_autologin(const char *root, char *out, size_t n) {
+    char path[1200];
+    snprintf(path, sizeof path, "%s/config/loginusers.vdf", root);
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    char line[512], id[32] = {0}, found[32] = {0};
+    while (fgets(line, sizeof line, f)) {
+        char a[128] = {0}, b[128] = {0};
+        if (sscanf(line, " \"%127[0-9]\"", a) == 1) {  // (a block key: the SteamID64)
+            snprintf(id, sizeof id, "%s", a);
+            continue;
+        }
+        if (sscanf(line, " \"%127[^\"]\" \"%127[^\"]\"", a, b) == 2 && !strcmp(a, "AutoLogin") && !strcmp(b, "1"))
+            snprintf(found, sizeof found, "%s", id);
+    }
+    fclose(f);
+    if (!found[0]) return false;
+    snprintf(out, n, "%llu", strtoull(found, NULL, 10) - 76561197960265728ull);
+    return true;
+}
+
+// <root>/userdata/<account>/config: the account Steam logs in by itself (the library the player sees), else the one with
+// the most recently written shortcuts.vdf, else the first one
 static bool steam_config_dir(const char *root, char *out, size_t n) {
+    char acct[32];
+    if (steam_autologin(root, acct, sizeof acct)) {
+        char cfg[1024];
+        snprintf(cfg, sizeof cfg, "%s/userdata/%s/config", root, acct);
+        if (is_dir(cfg)) { snprintf(out, n, "%s", cfg); return true; }
+    }
     char ud[1024];
     snprintf(ud, sizeof ud, "%s/userdata", root);
     DIR *d = opendir(ud);
@@ -83,7 +113,7 @@ static bool steam_running(void) {
         snprintf(p, sizeof p, "/proc/%s/comm", e->d_name);
         FILE *f = fopen(p, "r");
         if (!f) continue;
-        if (fgets(comm, sizeof comm, f) && !strncmp(comm, "steam", 5)) found = true;
+        if (fgets(comm, sizeof comm, f) && !strcmp(comm, "steam\n")) found = true;  // (the client itself: not steamos-*)
         fclose(f);
     }
     closedir(d);
