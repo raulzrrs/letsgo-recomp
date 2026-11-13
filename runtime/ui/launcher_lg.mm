@@ -383,6 +383,16 @@ static float g_drag_h, g_buttons_w;  // (logical pixels: the strip that drags th
 static SDL_HitTestResult SDLCALL launcher_hit(SDL_Window *win, const SDL_Point *pt, void *) {
     int w = 0, h = 0;
     SDL_GetWindowSize(win, &w, &h);
+    const int e = 6;  // (the resize rim, in px: the window has no frame, so its edges are the only handle)
+    bool left = pt->x < e, right = pt->x >= w - e, top = pt->y < e, bottom = pt->y >= h - e;
+    if (top && left) return SDL_HITTEST_RESIZE_TOPLEFT;
+    if (top && right) return SDL_HITTEST_RESIZE_TOPRIGHT;
+    if (bottom && left) return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+    if (bottom && right) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+    if (top) return SDL_HITTEST_RESIZE_TOP;
+    if (bottom) return SDL_HITTEST_RESIZE_BOTTOM;
+    if (left) return SDL_HITTEST_RESIZE_LEFT;
+    if (right) return SDL_HITTEST_RESIZE_RIGHT;
     return pt->y < g_drag_h && pt->x < w - g_buttons_w ? SDL_HITTEST_DRAGGABLE : SDL_HITTEST_NORMAL;
 }
 static int g_game_w = 1280, g_game_h = 720;
@@ -394,9 +404,15 @@ static void window_as_launcher(SDL_Window *win) {
     SDL_SetWindowFullscreen(win, false);
     SDL_Rect usable = {0, 0, 1920, 1040};
     SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(win), &usable);
-    int lh = usable.h * 86 / 100 < 900 ? usable.h * 86 / 100 : 900, lw = lh * 86 / 100;
+    int lh = usable.h * 86 / 100 < 900 ? usable.h * 86 / 100 : 900;
+    // (0.86 of the height - a window taller than wide - left "Wild battles (experimental)" and the sidebar's
+    // "Image and sound" cut off: the pages want a wide window, so this one starts wide and the player can resize it)
+    int lw = lh * 133 / 100;
+    if (lw > usable.w * 94 / 100) lw = usable.w * 94 / 100;
+    if (getenv("LARECOMP_LAUNCHER_SIZE")) sscanf(getenv("LARECOMP_LAUNCHER_SIZE"), "%dx%d", &lw, &lh);  // (tests)
     SDL_SetWindowBordered(win, false);
-    SDL_SetWindowResizable(win, false);
+    SDL_SetWindowResizable(win, true);
+    SDL_SetWindowMinimumSize(win, 720, 560);
     SDL_SetWindowSize(win, lw, lh);
     SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     SDL_SetWindowHitTest(win, launcher_hit, NULL);
@@ -567,6 +583,11 @@ extern "C" void launcher_lg_run(const char *root) {
         ImGui::PopStyleVar(2);
         ui_window_backdrop();
         float pad = 22 * s, side_w = 270 * s;
+        {   // the sidebar holds the page names: wide enough for the longest of them (no label gets cut off)
+            float tw = 0;
+            for (int i = 0; i < NTABS; i++) tw = fmaxf(tw, ImGui::CalcTextSize(names[i]).x);
+            side_w = fmaxf(side_w, tw + (pad + ui_inset()) * 2);
+        }
         g_drag_h = 70 * s, g_buttons_w = 120 * s;
 
         // ---- the sidebar: the icon and the name, the pages, Play
