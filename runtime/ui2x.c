@@ -217,19 +217,16 @@ static bool fetch_tool(void) {
     mkdir(TOOL_DIR, 0755);
     const char *zip = TOOL_DIR "/download.zip";
     remove(zip);
-    char win_curl[600], win_tar[600];
-    const char *curl, *tar;
+    const char *curl;
+    const char *unpack[8] = {0};  // (the archive's unpacker: bsdtar / 7z / unzip / python3 / tar, whatever is here)
 #ifdef _WIN32
+    char win_curl[600];
     const char *sys = getenv("SystemRoot");
     snprintf(win_curl, sizeof win_curl, "%s\\System32\\curl.exe", sys ? sys : "C:\\Windows");
-    snprintf(win_tar, sizeof win_tar, "%s\\System32\\tar.exe", sys ? sys : "C:\\Windows");
-    curl = win_curl, tar = win_tar;
+    curl = win_curl;
 #else
-    // (a spawned program is taken as given: curl for the download, bsdtar for the archive -- the same libarchive the
-    // Windows build gets from tar.exe)
     static const char *const curls[] = {"/usr/bin/curl", "/usr/local/bin/curl", "/bin/curl", NULL};
-    static const char *const tars[] = {"/usr/bin/bsdtar", "/usr/bin/tar", "/bin/bsdtar", "/bin/tar", NULL};
-    curl = rt_tool(curls), tar = rt_tool(tars);
+    curl = rt_tool(curls);
 #endif
     const char *dl[] = {curl, "-fsSL", "--retry", "2", "-o", zip, TOOL_URL, NULL};
     PlatProc p = plat_spawn(dl, TOOL_DIR "/download.log", false);
@@ -244,11 +241,20 @@ static bool fetch_tool(void) {
         remove(zip);
         return false;
     }
-    const char *un[] = {tar, "-xf", zip, "-C", TOOL_DIR, NULL};
-    p = plat_spawn(un, TOOL_DIR "/unpack.log", false);
+#ifdef _WIN32
+    unpack[0] = "tar.exe", unpack[1] = "-xf", unpack[2] = zip, unpack[3] = "-C", unpack[4] = TOOL_DIR;
+    bool have = true;
+#else
+    bool have = rt_unzip_cmd(zip, TOOL_DIR, unpack);
+#endif
+    p = have ? plat_spawn(unpack, TOOL_DIR "/unpack.log", false) : 0;
     r = p ? plat_proc_wait(p, true) : -1;
     remove(zip);
-    if (r != 0 || !is_file(exe)) { LOG("[ui2x] couldn't unpack the upscaler (tar %d)\n", r); return false; }
+    if (r != 0 || !is_file(exe)) {
+        LOG("[ui2x] couldn't unpack the upscaler (%s %d): 7z, unzip or python3 unpacks the zip\n",
+            have ? unpack[0] : "no unpacker", r);
+        return false;
+    }
 #ifndef _WIN32
     chmod(exe, 0755);  // (the zip records it; a file system without modes would not)
 #endif

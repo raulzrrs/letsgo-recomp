@@ -189,29 +189,31 @@ static void *install_thread(void *arg) {
     if (!name[0]) snprintf(name, sizeof name, "mod");
     mkdir("mods", 0755);
     const char *root = src;
-    if (!is_dir(src)) {  // an archive, unpacked into mods/.install: bsdtar on every OS (libarchive: .zip, .rar, .7z)
+    if (!is_dir(src)) {  // an archive, unpacked into mods/.install
         rm_tree("mods/.install");
         mkdir("mods/.install", 0755);
-        const char *tar;
+        const char *argv[8] = {0};
+        bool have = false;
 #ifdef _WIN32
         char sys_tar[600];
         const char *sys = getenv("SystemRoot");
         snprintf(sys_tar, sizeof sys_tar, "%s\\System32\\tar.exe", sys ? sys : "C:\\Windows");  // (Windows' own bsdtar)
-        tar = sys_tar;
+        argv[0] = sys_tar, argv[1] = "-xf", argv[2] = src, argv[3] = "-C", argv[4] = "mods/.install";
+        have = true;
 #else
-        // libarchive's tar, the same libarchive Windows' tar.exe is: bsdtar, else the plain tar (only .tar / .tgz)
-        static const char *const cand[] = {"/usr/bin/bsdtar", "/usr/bin/tar", "/bin/bsdtar", "/bin/tar", NULL};
-        tar = rt_tool(cand);
+        have = rt_unzip_cmd(src, "mods/.install", argv);  // (bsdtar, else 7z, unzip, python3, then the plain tar)
 #endif
         const char *tarenv = getenv("LARECOMP_TAR");
-        if (tarenv && *tarenv) tar = tarenv;
-        const char *argv[] = {tar, "-xf", src, "-C", "mods/.install", NULL};
-        PlatProc p = plat_spawn(argv, "mods/.install.log", false);
+        if (tarenv && *tarenv) {  // (still an override: the program, called as `tar -xf archive -C dir`)
+            argv[0] = tarenv, argv[1] = "-xf", argv[2] = src, argv[3] = "-C", argv[4] = "mods/.install", argv[5] = NULL;
+            have = true;
+        }
+        PlatProc p = have ? plat_spawn(argv, "mods/.install.log", false) : 0;
         int r = p ? plat_proc_wait(p, true) : -1;
         remove("mods/.install.log");
         if (r != 0) {
-            LOG("[mods] couldn't unpack %s (%s %d): bsdtar installs with libarchive (Fedora: bsdtar, Debian: "
-                "libarchive-tools)\n", src, tar, r);
+            LOG("[mods] couldn't unpack %s (%s %d): install bsdtar (Fedora), libarchive-tools (Debian) or 7z\n", src,
+                have ? argv[0] : "no unpacker", r);
             g_install_state = MOD_INSTALL_FAIL_UNPACK;
             goto done;
         }
