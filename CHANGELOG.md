@@ -5,6 +5,10 @@
 - **Integrated GPUs keep some memory free** (issues #59, #63: crashes after "out of device memory", #59 on an Intel UHD 620):
   the game's memory shared with the GPU now stops 1.5 GB short of the GPU's memory, never under 2 GB, and the log says
   how much the GPU has. Tested by simulating the limit on an NVIDIA card, not on an affected PC.
+- **Mods with files bigger than the game's own no longer crash it** (issue #55: `2002-6063` with upscaled sprites): the
+  game reads each file into a buffer from heaps sized for its own files (8 MB while starting); a file that doesn't fit
+  is now read into a 256 MB reserve instead. Tested with a 64 MB file at start and in the Pokédex, in both games; not
+  with the mod from the issue (bigger textures may still hit other limits). Not on Eevee 1.0.2.
 - **When the game code fails to build, the log has the reason** (issue #54): the generator's whole error goes to
   `lasrecomp.log`, and the start screen no longer blames disk space.
 
