@@ -15,6 +15,10 @@
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 #include <pthread.h>
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 
