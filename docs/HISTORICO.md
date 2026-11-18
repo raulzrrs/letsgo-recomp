@@ -934,3 +934,22 @@ Pedido: capturar a qualquer momento da batalha, mais fácil com o selvagem fraco
   (`LARECOMP_VERTEX_READ=direct LARECOMP_VK_GMEM_MAX_MB=2304`) contra o mesmo sem limite: sem crash, sem erro Vulkan,
   texto e ícones presentes; as diferenças de quadro nos menus são de tempo (transição em outro quadro).
 - **#64 continua em aberto:** a queda é antes da importação, então o limite não tem por que resolvê-la.
+
+## Issue #55: arquivos grandes de mods paravam o jogo com 2002-6063 (18/11/2026)
+- **Relato.** Um mod de sprites em 256x256 (arquivos maiores que os do jogo) fecha o jogo no boot; no emulador também.
+  Log: `svcBreak result 0x2f5e02 = 2002-6063` vindo de `nn::fs::ReadFile` (`nn::diag::detail::Abort`).
+- **Reprodução sem o mod.** Um mod de teste com `bin/app/icon_pokemon/dummy.arc` do jogo mais 60 MB de zeros dá o mesmo
+  erro no mesmo lugar. O 2002-6063 é o `ReadFile` recebendo buffer nulo.
+- **Causa.** `f_7000032220` lê o arquivo inteiro num buffer do tamanho dele, pedido a um heap do próprio jogo (pools TLSF
+  do gflib: `Allocate` `f_700001b910`, `Free` `f_700001b970`, criados em `f_7000004110`, cada filho do tamanho exato do
+  que sobra no pai). No boot esse heap tem 8 MB (`0x800000` em `0x7000004504`; o log do `lm` lista os pools: idx[4]); o
+  Pokédex usa outro. Aumentar o heap do boot pedindo mais ao pai derrubou o heap seguinte (o pai fica sem espaço).
+  `LARECOMP_HOOK_DUMP` ganhou `*x0+8:` (ponteiro guardado num deslocamento) para achar o heap.
+- **Correção** (`runtime/hle/file_heap.c`). Quando o `Allocate` do buffer de arquivo (retorno `0x7000032260`) falha, o
+  buffer vem de uma reserva no fim da janela do guest (`0x7310000000`, 256 MB, depois do máximo do heap do kernel), e o
+  `Free` desse ponteiro volta para lá. Precisa ser memória do guest: um bloco do host (como os unit heaps do `heaps.c`)
+  chegou cortado ao serviço de arquivos (o descritor de IPC guarda 39 bits do endereço). Mesmos endereços no Pikachu
+  1.0.0 (`addrmap.py`); sem mapa para o Eevee 1.0.2. `LARECOMP_FILE_RESERVE=0` desliga.
+- **Teste.** Com o arquivo de 64 MB: o boot e a abertura do Pokédex leem pela reserva (duas linhas `[heaps]`), os ícones
+  aparecem e o jogo volta ao mundo. Não testado com o mod real (texturas maiores podem esbarrar em outros limites depois
+  da leitura).

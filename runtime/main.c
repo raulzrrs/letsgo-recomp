@@ -197,6 +197,7 @@ int main(int argc, char **argv) {
         { extern void wildbattle_configure(void); wildbattle_configure(); }  // (runtime/hle/wildbattle.c: the wild battles option)
         { extern void controller_skip_configure(void); controller_skip_configure(); }  // (runtime/hle/controller_skip.c)
         { extern void cutscene_configure(void); cutscene_configure(); }  // (runtime/hle/cutscene.c)
+        { extern void file_heap_configure(void); file_heap_configure(); }  // (runtime/hle/file_heap.c: issue #55)
         boot(root);
         int kind = ui_run();  // window and input on the main thread; returns when a reboot is requested
         teardown();

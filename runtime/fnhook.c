@@ -49,6 +49,7 @@ static const uint64_t k_pikachu_100[][2] = {
     {0x7000ab4a30, 0x7000ab4a40}, {0x7000ab4a50, 0x7000ab4a60}, {0x700028c770, 0x700028c740}, {0x70009d8ae0, 0x70009d8af0},
     {0x70007de080, 0x70007de0b0}, {0x7000a5c350, 0x7000a5c360}, {0x7000aaf230, 0x7000aaf240}, {0x7000319bc0, 0x7000319b90}, {0x70007de440, 0x70007de470}, {0x70009f7300, 0x70009f7310},
     {0x7000a7e090, 0x7000a7e0a0}, {0x7000a99b40, 0x7000a99b50}, {0x7000a9c700, 0x7000a9c710}, {0x700016d060, 0x700016d030}, {0x700017f280, 0x700017f250},
+    {0x700001b910, 0x700001b910}, {0x700001b970, 0x700001b970}, {0x7000032260, 0x7000032260},  // (file_heap.c: the game's heaps, file reads)
 };
 // Let's Go Eevee 1.0.2 (the update: the code moved by up to -0x130; the data, globals and GOT slots are where they
 // were). The four not unique by addrmap (two destructors, the factory, the frame constructor) by their neighbours' offset,

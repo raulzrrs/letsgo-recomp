@@ -119,6 +119,7 @@ começar com o turno do selvagem (normalmente só depois de uma bola que estouro
 | `LARECOMP_LOG_B2B=1` | as 60 primeiras cópias de buffer: origem, destino, tamanho e se esperaram a GPU (`[b2b]`) |
 | `LARECOMP_LOG_GPUREADS=1` | loga cada faixa de memória que um shader de memória global pode ler (storage buffers ligados) |
 | `LARECOMP_VK_NO_GMEM=1` / `LARECOMP_VK_GMEM_MAX_MB=<n>` | sem a importação do heap (o texto do jogo some, issue #49) / recusa importações maiores que n MB, como um driver faria |
+| `LARECOMP_FILE_RESERVE=0` | sem a reserva para arquivos grandes (issue #55): um arquivo maior que o heap do jogo volta a parar o jogo com 2002-6063. O log diz `[heaps] a N KB file has no room in the game's heap` quando a reserva é usada |
 | `LARECOMP_NO_BRA_IF=1` | todo BRA passa pelo `switch` do shader, sem virar `if` (issue #24) |
 | `LARECOMP_LOG_GPUWRITES=1` | loga cada faixa de memória que um compute pode escrever (storage buffers ligados) ao entrar no conjunto |
 | `LARECOMP_HLE_WHO=<endereço falso, hex>[,...]` | no boot, imprime o nome da função do host por trás de um endereço `0x70800000xx` visto num `LARECOMP_THREAD_DUMP` |
@@ -230,7 +231,7 @@ Não ligue debug info nos shaders para capturar: com milhares de shaders, o repl
   bytes seguintes, `n` registros de 0x40 antes e os ponteiros para a base (runtime/hle/memscan.c, só Windows).
 - `LARECOMP_HOOK_DUMP="<addr>:<args>[;...]"` (endereço completo do guest, ex.: `700028ef70`; o offset do `main`
   sozinho não dispara) registra, nas primeiras `LARECOMP_HOOK_DUMP_MAX` (4) entradas, x0..x7 e a
-  memória dos argumentos: `x2:30` = 0x30 bytes em x2; `*x0:400` = 0x400 bytes no ponteiro guardado em x0.
+  memória dos argumentos: `x2:30` = 0x30 bytes em x2; `*x0:400` = 0x400 bytes no ponteiro guardado em x0; `*x0+8:400` = no ponteiro guardado em x0 + 8.
 
 ### Referências cruzadas no código do jogo (`tools/xrefs.py`)
 `cd tools && ../.venv/Scripts/python xrefs.py calls <addr>` (quem chama a função que contém o endereço), `imm <valor>`
