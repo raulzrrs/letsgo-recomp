@@ -1,6 +1,7 @@
 // LAS Recomp entry: load modules, set up the kernel, run nn::init::Start on the main thread.
 #include <SDL3/SDL.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -171,13 +172,28 @@ int main(int argc, char **argv) {
 #endif
     const char *root = "extracted";  // (in the data root)
     bool skip_launcher = getenv("LARECOMP_NO_LAUNCHER") || getenv("LARECOMP_INPUT");  // tests boot straight in
-    static char arg_root[1024];
+    static char arg_root[1024], arg_game[1024];
+    const char *game = NULL;  // --game <folder>: the player's extracted game, given by a launcher (RecompLauncher)
+    bool prepare = false;     // --prepare: set the game up without a window, then exit (needs --game), for a launcher
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--play")) skip_launcher = true;
-        else if (argv[i][0] != '-' && !realpath(argv[i], arg_root)) root = argv[i];  // (relative to where we started)
+        else if (!strcmp(argv[i], "--prepare")) prepare = true;
+        else if (!strcmp(argv[i], "--game") && i + 1 < argc) {
+            i++;  // (the folder is the option's value, not the data folder below)
+            game = realpath(argv[i], arg_game) ? arg_game : argv[i];
+        } else if (argv[i][0] != '-' && !realpath(argv[i], arg_root)) root = argv[i];  // (relative to where we started)
         else if (argv[i][0] != '-') root = arg_root;
     }
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
+    if (prepare && !game) {
+        fprintf(stderr, "--prepare needs --game <folder>\n");
+        return 2;
+    }
+    if (prepare) return setup_prepare(game);
+    if (game && !setup_ready()) {  // not set up yet: the start screen shows the setup of that folder
+        skip_launcher = false;
+        if (!setup_needs_build()) setup_start(game);  // (only the game code is missing: the start screen rebuilds it)
+    }
     for (bool title = !skip_launcher;;) {
         if (title) {  // start screen: resolution, fullscreen, anti-aliasing, translation, keys (runtime/ui/launcher_lg.mm)
             extern void launcher_lg_run(const char *root);

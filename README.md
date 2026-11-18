@@ -5,6 +5,8 @@ A native Windows port of **Pokémon: Let's Go, Eevee!** and **Let's Go, Pikachu!
 for the Switch (system services, NVN graphics on Vulkan, audio, controllers). **It is not an emulator.** Built on
 **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai.
 
+<a href="https://recomplauncher.com/game/letsgo-recomp"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
 > [!IMPORTANT]
 > **No game files are included.** You need your own legally obtained copy of *Let's Go, Eevee!* or *Pikachu!*,
 > extracted (the `exefs` and `romfs` folders). A fan project, not affiliated with Nintendo, The Pokémon Company, Game
