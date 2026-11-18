@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.7 (2026-11-18)
+
+- **Integrated GPUs keep some memory free** (issues #59, #63: crashes after "out of device memory", #59 on an Intel UHD 620):
+  the game's memory shared with the GPU now stops 1.5 GB short of the GPU's memory, never under 2 GB, and the log says
+  how much the GPU has. Tested by simulating the limit on an NVIDIA card, not on an affected PC.
+- **When the game code fails to build, the log has the reason** (issue #54): the generator's whole error goes to
+  `lasrecomp.log`, and the start screen no longer blames disk space.
+
 ## 0.7.6 (2026-11-01)
 
 - **Fix: the game froze after a long session** (issues #21, #33, #35, #51): two of the renderer's tables were fixed in size;
