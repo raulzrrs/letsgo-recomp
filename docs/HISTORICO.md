@@ -920,3 +920,17 @@ Pedido: capturar a qualquer momento da batalha, mais fácil com o selvagem fraco
   O log só guardava a última linha do log do gerador; o traceback do Python, que diz onde quebrou, ficava de fora.
 - **Mudança.** Gerador que falha copia o fim do seu log inteiro para o `lasrecomp.log` (`log_tail_all`, com o código de
   saída); o aviso do launcher não culpa mais o espaço em disco e pede o log. A causa depende do traceback do autor.
+
+## Issues #59 / #63 / #64: crashes em GPU integrada (Intel UHD 620) na 0.7.6 (18/11/2026)
+- **Logs.** #59 (UHD 620, Vulkan 1.3.215): `ImGui: Vulkan call failed: -2` (`VK_ERROR_OUT_OF_DEVICE_MEMORY`) e depois
+  `c0000005` no `igvk64.dll`, vindo de `ImGui_ImplVulkan_RenderDrawData` (símbolos da 0.7.6 recompilada da tag). #63 (GPU
+  não informada): `sr failed: -2` em `exec.c:313` (o `vkQueueSubmit2`) logo depois de `guest heap imported ... 3220 MB`.
+  #64 (UHD 620, 1.3.208): `c0000005` no driver dentro de `vkCmdBeginRendering` (`begin_pass` ← `clear`), antes da importação.
+- **Hipótese** (não provada, sem Intel aqui): numa GPU integrada a importação do heap fixa as páginas no único heap de memória
+  da GPU; o driver aceita os 3220 MB e as alocações seguintes falham. Combina com #52/#53 (integradas, falhas de alocação).
+- **Mitigação** (`runtime/nvn/vulkan/exec.c`, `gmem_uma_cap`). Em GPU integrada a importação para em "heap device-local −
+  1,5 GB", nunca abaixo de 2 GB (o texto lê até ~1,65 GB no heap, #49); o log dá o tamanho do heap e o limite. Leituras além
+  do limite voltam zero e os vértices além dele são copiados. Bateria nos dois jogos simulando o caminho integrado
+  (`LARECOMP_VERTEX_READ=direct LARECOMP_VK_GMEM_MAX_MB=2304`) contra o mesmo sem limite: sem crash, sem erro Vulkan,
+  texto e ícones presentes; as diferenças de quadro nos menus são de tempo (transição em outro quadro).
+- **#64 continua em aberto:** a queda é antes da importação, então o limite não tem por que resolvê-la.

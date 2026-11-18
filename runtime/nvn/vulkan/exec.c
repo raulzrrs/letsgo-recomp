@@ -2875,9 +2875,31 @@ static uint64_t gmem_cap = HEAP_MAX;  // the largest import the driver takes, on
 
 // A driver may refuse the whole heap (issue #49: all the game's text is drawn from storage buffers, ~1.4-1.65 GB into the heap, so
 // without the import it is blank): the import then covers less, from the heap's start. Reads past its end return zero (robustBufferAccess).
+// On an integrated GPU the pinned import counts against the one memory heap the GPU has (issues #59 / #63, Intel UHD 620:
+// the driver took all 3220 MB, then later allocations failed with VK_ERROR_OUT_OF_DEVICE_MEMORY). There the import stops
+// GMEM_UMA_SPARE below the heap's size, but not under GMEM_UMA_FLOOR (the text reads up to ~1.65 GB into the heap, #49).
+#define GMEM_UMA_SPARE 0x60000000ull  // (1.5 GB)
+#define GMEM_UMA_FLOOR 0x80000000ull  // (2 GB)
+static void gmem_uma_cap(void) {
+    if (g_vk.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) return;
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+    uint64_t heap = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+        if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > heap) heap = mp.memoryHeaps[i].size;
+    if (!heap) return;
+    uint64_t cap = heap > GMEM_UMA_FLOOR + GMEM_UMA_SPARE ? (heap - GMEM_UMA_SPARE) / GMEM_STEP * GMEM_STEP : GMEM_UMA_FLOOR;
+    if (cap < gmem_cap) gmem_cap = cap;
+    LOG("[vk] integrated GPU, memory heap %llu MB: guest heap import limited to %llu MB\n", (unsigned long long)(heap >> 20),
+        (unsigned long long)(gmem_cap >> 20));
+}
+
 static VkDescriptorBufferInfo gmem_info(void) {
     static int off = -1;
-    if (off < 0) off = getenv("LARECOMP_VK_NO_GMEM") != NULL || !g_vk.host_import;
+    if (off < 0) {
+        off = getenv("LARECOMP_VK_NO_GMEM") != NULL || !g_vk.host_import;
+        if (!off) gmem_uma_cap();
+    }
     uint64_t want = (kernel_heap_size() + 0xFFFF) & ~0xFFFFull;
     if (want > gmem_cap) want = gmem_cap;
     if (!off && want > gmem_size && !gmem_import(want)) {
