@@ -5,7 +5,7 @@
 //
 // Investigation (docs/MODO-BATALHA.md): LARECOMP_HOOK_DUMP="<addr>:<arg>,<arg>...[;<addr>:...]" logs, the first
 // LARECOMP_HOOK_DUMP_MAX (default 4) times each function is entered, the registers x0..x7 and the memory the args
-// name: "x2:30" = 0x30 bytes at x2, "*x0:400" = 0x400 bytes at the pointer stored at x0. LARECOMP_HOOK_DUMP_FRAMES=
+// name: "x2:30" = 0x30 bytes at x2, "*x0:400" = 0x400 bytes at the pointer stored at x0 ("*x0+8:400": at x0 + 8). LARECOMP_HOOK_DUMP_FRAMES=
 // <first>-<last> limits it to those presents (the count then starts there).
 #include <stdatomic.h>
 #include <stdio.h>
@@ -180,7 +180,7 @@ void rt_call_original(Cpu *c, uint64_t addr) {
 }
 
 // ---- LARECOMP_HOOK_DUMP
-typedef struct { uint64_t addr; int nargs; struct { int reg, deref; uint32_t len; } arg[8]; _Atomic int hits; } Dump;
+typedef struct { uint64_t addr; int nargs; struct { int reg, deref; uint32_t off, len; } arg[8]; _Atomic int hits; } Dump;
 static Dump dumps[32];
 static int ndumps, dump_max = 4;
 
@@ -215,7 +215,7 @@ static int dump_hook(Cpu *c, uint64_t addr) {
             uint64_t p = c->x[d->arg[k].reg];
             char what[16];
             snprintf(what, sizeof what, "%sx%d", d->arg[k].deref ? "*" : "", d->arg[k].reg);
-            if (d->arg[k].deref) p = guest_ptr(p) ? *(const uint64_t *)(uintptr_t)p : 0;
+            if (d->arg[k].deref) p = guest_ptr(p + d->arg[k].off) ? *(const uint64_t *)(uintptr_t)(p + d->arg[k].off) : 0;
             hexdump(what, p, d->arg[k].len);
         }
     }
@@ -242,9 +242,11 @@ __attribute__((constructor)) static void hook_dump_init(void) {
             if (deref) a++;
             if (*a != 'x') break;
             int reg = (int)strtol(a + 1, &a, 10);
+            uint32_t off = *a == '+' ? (uint32_t)strtoul(a + 1, &a, 16) : 0;  // "*x0+8": the pointer stored at x0 + 8
             uint32_t len = *a == ':' ? (uint32_t)strtoul(a + 1, &a, 16) : 0x40;
             d->arg[d->nargs].reg = reg;
             d->arg[d->nargs].deref = deref;
+            d->arg[d->nargs].off = off;
             d->arg[d->nargs].len = len;
             d->nargs++;
             while (*a == ',') a++;
