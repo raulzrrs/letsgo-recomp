@@ -339,8 +339,8 @@ desmaia como nas batalhas de treinador (`ee620`; `a9c700` responde "sem junta" a
 `16d060` (eventos do Wwise por nome) não manda o `Pop_BGM_battle_to_field` de uma captura que volta para a batalha nem o
 `Push_BGM_field_to_battle` da volta. Pikachu: `a9c700` → `a9c710`, `16d060` → `16d030`.
 
-**Falta**: com o mod de tradução PT-BR o CATCH aparece como um quadrado preto (HISTORICO); a espera de ~12 s entre escolher (CATCH ou o RUN do jogo, igual) e a batalha sair; natureza/shiny/habilidade
-do Pokémon tocado; ver uma batalha de treinador de verdade com o menu original (testado só com `CATCH_MENU=0`); os
+**Falta**: com o mod de tradução PT-BR o CATCH aparece como um quadrado preto (HISTORICO); a espera de ~12 s entre escolher (CATCH ou o RUN do jogo, igual) e a batalha sair; natureza/habilidade
+do Pokémon tocado (o shiny e o tamanho passam desde a issue #67); ver uma batalha de treinador de verdade com o menu original (testado só com `CATCH_MENU=0`); os
 rótulos dentro do jogo em outros idiomas (conferidos decodificando os arquivos montados, `CATCH_DUMP`).
 
 ## Próximas etapas

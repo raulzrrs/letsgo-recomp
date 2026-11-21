@@ -94,8 +94,11 @@ static uint8_t g_rec[0x60] __attribute__((aligned(16)));  // (the synthetic reco
 // What the builder reads from the touched Pokémon's object P (docs/MODO-BATALHA.md): species f_70002185d0(P), form
 // f_70002186a0(P), level = byte P+0xf0c, IVs = six bytes P+0xf18, +0xf1c, ... +0xf2c, gender = word P+0x40c (0 male, 1 female,
 // else none: the builder turns it into 1 / 2 / 0, the record's fixed-gender codes).
+// Shiny = byte P+0x410 (the builder passes 1 "always" when set, 2 "never" when not), weight and height = u16 P+0xf10 /
+// P+0xf12 (they end up as PB7's +0x3B / +0x3A; issue #67: the battle rolled them again).
 static bool g_wild_valid;
-static uint32_t g_wild_species, g_wild_form, g_wild_level, g_wild_gender;
+static uint32_t g_wild_species, g_wild_form, g_wild_level, g_wild_gender, g_wild_shiny;
+static uint16_t g_wild_height, g_wild_weight;
 static int8_t g_wild_iv[6];
 static bool g_explicit;  // LARECOMP_WILDBATTLE_SPECIES given: that one, whatever was touched
 static bool g_moves_given;  // LARECOMP_WILDBATTLE_MOVES given: those moves, not the level-up ones
@@ -118,6 +121,11 @@ static int logpoke_hook(Cpu *c, uint64_t addr) {
     g_wild_level = R8(p, 0xf0c);
     g_wild_gender = R32(p, 0x40c) == 0 ? 1 : R32(p, 0x40c) == 1 ? 2 : 0;
     for (int i = 0; i < 6; i++) g_wild_iv[i] = (int8_t)R8(p, 0xf18 + 4 * i);
+    g_wild_shiny = R8(p, 0x410) ? 1 : 2;
+    if (getenv("LARECOMP_WILDBATTLE_SHINY")) g_wild_shiny = 1;  // (test: as if the touched Pokémon were shiny)
+    g_wild_weight = *(volatile uint16_t *)(uintptr_t)(p + 0xf10);
+    g_wild_height = *(volatile uint16_t *)(uintptr_t)(p + 0xf12);
+    if (getenv("LARECOMP_WILDBATTLE_SIZE")) g_wild_height = g_wild_weight = (uint16_t)atoi(getenv("LARECOMP_WILDBATTLE_SIZE"));  // (test: 0 smallest .. 255)
     g_wild_valid = true;
     if (!getenv("LARECOMP_WILDBATTLE_LOGPOKE")) return 0;
     LOG("[wild] f%llu builder: P %llx species %llu form %llu | +f0c %u +f10 %u +f12 %u | +f18..f2c %d %d %d %d %d %d | +40c %u +410 %u\n",
@@ -164,6 +172,16 @@ static int config_hook(Cpu *c, uint64_t addr) {
         uint32_t keep = *(const uint32_t *)(from_rec + 0x298);
         memcpy((void *)(uintptr_t)cfg, g_cfg, CFG_SIZE);
         *(uint32_t *)(uintptr_t)(cfg + 0x298) = keep;
+    }
+    // The Pokémon's setup inside the configuration (+0x58, filled from the record by f_70002f6160): shiny +8, weight +0x4a,
+    // height +0x4c, set as the game's capture of the same Pokémon does (f_70003058f0). Not through the record: its
+    // sizes only pass from 1 up, and a Pokémon of the smallest size has 0.
+    if (g_wild_valid && !g_explicit) {
+        uint64_t spec = cfg + 0x58;
+        *(uint32_t *)(uintptr_t)(spec + 8) = g_wild_shiny;
+        *(uint16_t *)(uintptr_t)(spec + 0x4a) = g_wild_weight;
+        *(uint16_t *)(uintptr_t)(spec + 0x4c) = g_wild_height;
+        LOG("[wild] the touched Pokémon: %s, height %u, weight %u\n", g_wild_shiny == 1 ? "shiny" : "not shiny", g_wild_height, g_wild_weight);
     }
     return 1;
 }
@@ -883,6 +901,30 @@ static bool poke_state(uint64_t param, PokeState *st) {
     return true;
 }
 
+// The core block decrypted and in order (PB7: species u16 +8, height +0x3A, weight +0x3B; four blocks of 0x38 bytes from +8,
+// shuffled by ((key >> 13) & 31) % 24). Tests: the size a wild Pokémon carries into the battle (issue #67).
+static bool poke_core(uint64_t param, uint8_t out[0xe8]) {
+    static const uint8_t pos[24][4] = {{0,1,2,3},{0,1,3,2},{0,2,1,3},{0,3,1,2},{0,2,3,1},{0,3,2,1},{1,0,2,3},{1,0,3,2},
+        {2,0,1,3},{3,0,1,2},{2,0,3,1},{3,0,2,1},{1,2,0,3},{1,3,0,2},{2,1,0,3},{3,1,0,2},{2,3,0,1},{3,2,0,1},{1,2,3,0},
+        {1,3,2,0},{2,1,3,0},{3,1,2,0},{2,3,1,0},{3,2,1,0}};
+    uint64_t acc = param ? R64(param, 0x98) : 0, core = acc ? R64(acc, 0x10) : 0;
+    if (!core) return false;
+    uint8_t d[0xe8];
+    memcpy(d, (const void *)(uintptr_t)core, sizeof d);
+    uint32_t key = *(const uint32_t *)d;
+    if (R8(acc, 0x18)) {
+        uint32_t seed = key;
+        for (int i = 0; i < 0xe0 / 2; i++) {
+            seed = seed * 0x41C64E6Du + 0x6073u;
+            ((uint16_t *)(d + 8))[i] ^= (uint16_t)(seed >> 16);
+        }
+    }
+    memcpy(out, d, 8);
+    const uint8_t *o = pos[((key >> 13) & 31) % 24];
+    for (int b = 0; b < 4; b++) memcpy(out + 8 + 0x38 * b, d + 8 + 0x38 * o[b], 0x38);
+    return true;
+}
+
 // Research (LARECOMP_WILDBATTLE_HPSCAN=<A>:<B>, frames from the battle's start): where the battle keeps the wild Pokémon's
 // HP. At A (full HP) every u16 of the heaps equal to its max HP is kept; at B (after a hit) those that dropped are logged.
 static unsigned g_scan_max_hp;
@@ -1131,6 +1173,9 @@ static int setup_hook(Cpu *c, uint64_t addr) {
     if (g_hp_log)
         LOG("[wild] f%llu battle Pokémon %llx set up: species %u HP %u/%u, id %u\n", (unsigned long long)renderer_game_frame(),
             (unsigned long long)b, R16(b, 0x78), R16(b, 0x7e), R16(b, 0x7c), id);
+    uint8_t core[0xe8];
+    if (g_hp_log && id >= 6 && poke_core(R64(b, 0x60), core))
+        LOG("[wild]   its pml data: species %u height %u weight %u\n", *(const uint16_t *)(core + 8), core[0x3a], core[0x3b]);
     return 1;
 }
 
@@ -1326,7 +1371,8 @@ void wildbattle_configure(void) {
     rt_register_fnhook(WORLD_TICK, field_hook);  // (the fade-in after a battle, and the battle again after a capture)
     rt_register_fnhook(STATIC_CTOR, ctor_hook);
     rt_register_fnhook(TABLE_LOOKUP, lookup_hook);
-    if (g_usecfg) { rt_register_fnhook(CONFIG_FROM_RECORD, config_hook); rt_register_fnhook(CONFIG_BUILD, build_hook); }
+    rt_register_fnhook(CONFIG_FROM_RECORD, config_hook);  // (the touched Pokémon's shiny and size; with USECFG, all of it)
+    if (g_usecfg) rt_register_fnhook(CONFIG_BUILD, build_hook);
     rt_register_fnhook(WILD_BUILDER, logpoke_hook);
 #ifdef _WIN32
     if (getenv("LARECOMP_WILDBATTLE_HPSCAN")) {

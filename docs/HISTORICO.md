@@ -953,3 +953,18 @@ Pedido: capturar a qualquer momento da batalha, mais fácil com o selvagem fraco
 - **Teste.** Com o arquivo de 64 MB: o boot e a abertura do Pokédex leem pela reserva (duas linhas `[heaps]`), os ícones
   aparecem e o jogo volta ao mundo. Não testado com o mod real (texturas maiores podem esbarrar em outros limites depois
   da leitura).
+
+## Issue #67: o shiny e o tamanho do Pokémon do mapa sumiam na batalha selvagem (21/11/2026)
+- **Relato.** Com as batalhas selvagens, tocar num shiny ou num Pokémon grande/pequeno dava a batalha com um comum.
+- **Causa.** A batalha é montada do registro sintético (`lookup_hook`), copiado do Snorlax: shiny 0 (sorteia de novo) e
+  sem altura/peso. `f_70002f6160` copia o registro para a montagem do Pokémon (`cfg+0x58`): shiny `+8` (só 0..2),
+  `+0x4a`/`+0x4c` dos campos `+0x46`/`+0x44` do registro, e só a partir de 1. A captura nativa do mesmo Pokémon
+  (`f_70003058f0`) põe ali shiny = 1 (sempre) se o byte `P+0x410` do Pokémon do mapa for diferente de 0, senão 2 (nunca), e
+  `P+0xf10` / `P+0xf12` nos dois campos (no PB7 viram o peso `+0x3B` e a altura `+0x3A`).
+- **Correção** (`runtime/hle/wildbattle.c`, `config_hook`, agora sempre ligado). Depois da montagem pelo registro, os três
+  campos recebem os valores do Pokémon do mapa, como na captura nativa. Opções de teste `LARECOMP_WILDBATTLE_SHINY=1` e
+  `_SIZE=<n>`; com `_HPLOG=1` o log decifra o bloco principal do Pokémon da batalha (`poke_core`).
+- **Teste** (`tools/capture_loop.py`, save `build/save-edit`). Eevee: Rattata shiny (verde, com o brilho na entrada);
+  altura/peso do mapa 90/142 e forçados 255/255 chegam iguais aos dados do Pokémon da batalha. Pikachu: Caterpie shiny
+  (amarelo), 153/142 iguais. O modelo na batalha não muda de tamanho com a altura (255 e 105 do mesmo tamanho): é o jogo.
+  Natureza e habilidade continuam sorteadas (a captura nativa também não as passa).
