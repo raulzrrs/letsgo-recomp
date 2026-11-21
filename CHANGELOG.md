@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.8 (2026-11-21)
+
+- **Wild battles keep the touched Pokémon's shiny and size** (issue #67): a shiny or a huge / tiny Pokémon on the map
+  came into the battle as an ordinary one. Its shiny colours, height and weight now carry over, as in the game's own
+  capture (tested in both games with a shiny and with the largest size). Battle models are drawn at one size, as in the
+  game; the size is in the Pokémon's data.
+- **Controller layout "Nintendo, A / B swapped"** (issue #66): A on the bottom button and B on the right, with X and Y
+  where Nintendo has them, for button prompt mods made that way (the launcher's Game page; `pad_layout = swap_ab`).
+
 ## 0.7.7 (2026-11-18)
 
 - **Integrated GPUs keep some memory free** (issues #59, #63: crashes after "out of device memory", #59 on an Intel UHD 620):
