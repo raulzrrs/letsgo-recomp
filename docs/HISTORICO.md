@@ -968,3 +968,12 @@ Pedido: capturar a qualquer momento da batalha, mais fácil com o selvagem fraco
   altura/peso do mapa 90/142 e forçados 255/255 chegam iguais aos dados do Pokémon da batalha. Pikachu: Caterpie shiny
   (amarelo), 153/142 iguais. O modelo na batalha não muda de tamanho com a altura (255 e 105 do mesmo tamanho): é o jogo.
   Natureza e habilidade continuam sorteadas (a captura nativa também não as passa).
+
+## Issue #66: um layout de controle que troca só A e B (21/11/2026)
+- **Pedido** (stingflyer, autor de um mod de ícones de PlayStation): os layouts eram Nintendo (A à direita, B embaixo) ou
+  Xbox (A embaixo, B à direita, e X / Y também trocados). O mod dele precisa de A / B trocados com X / Y no lugar da Nintendo.
+- **Mudança** (`runtime/hle/bindings.c`, `BIND_LAYOUT_SWAP_AB`): terceiro layout, `pad_layout = swap_ab` no
+  `larecomp.ini`, "Nintendo, A / B trocados" no launcher (página Jogo). Só A e B vão para as posições do Xbox; o menu
+  sobreposto confirma com o botão de baixo, como no Xbox (`menu.mm`). Remapeamentos da página Controles continuam valendo.
+- **Teste.** O `ini` carrega o layout (log `[input] controller layout: Nintendo with A / B swapped`) e o launcher mostra a
+  opção. Os botões de um controle físico não foram apertados no teste automático (o `LARECOMP_INPUT` não passa pelo mapa).

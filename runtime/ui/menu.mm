@@ -115,9 +115,9 @@ static ImGuiKey key_from_scancode(SDL_Scancode sc) {
 }
 
 // A confirms, B goes back, as in the game: by the controller layout (runtime/hle/bindings.c) - Nintendo: A the right
-// face button, B the bottom one; Xbox: A the bottom one, B the right one.
+// face button, B the bottom one; Xbox and Nintendo with A / B swapped: A the bottom one, B the right one.
 static ImGuiKey key_from_pad(Uint8 b) {
-    bool xbox = bind_layout() == BIND_LAYOUT_XBOX;
+    bool xbox = bind_layout() != BIND_LAYOUT_NINTENDO;  // (A on the bottom button)
     switch (b) {
     case SDL_GAMEPAD_BUTTON_EAST: return xbox ? ImGuiKey_GamepadFaceRight : ImGuiKey_GamepadFaceDown;   // activate (Nintendo)
     case SDL_GAMEPAD_BUTTON_SOUTH: return xbox ? ImGuiKey_GamepadFaceDown : ImGuiKey_GamepadFaceRight;  // cancel / back (Nintendo)

@@ -29,7 +29,7 @@ area at 2x. Not Switch captures.* ▶ [Showcase video](https://youtu.be/mGk-wBu1
 - The game's **30 fps**, or **60 / 120 fps** in the overworld (experimental), plus **frame generation** (2x / 3x / 4x, any GPU)
 - **2x interface** images and sharper text
 - **Mods**: fan translations and other LayeredFS mods, several at once
-- Keyboard and mouse (aim Poké Balls, touch screen) and any controller, with the Nintendo or Xbox button layout; every key rebindable
+- Keyboard and mouse (aim Poké Balls, touch screen) and any controller, with the Nintendo or Xbox button layout (or Nintendo with only A and B swapped); every key rebindable
 - Experimental **wild battles** (a classic battle, then the capture) and **skip controller selection**
 - Shaders cached on disk
 
