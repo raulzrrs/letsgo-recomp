@@ -43,6 +43,9 @@ int game_build(const char *exefs);
 const char *game_version(const char *exefs);
 // Starts a setup from the picked folder (NULL: only rebuild the game code from files set up already).
 void setup_start(const char *folder);
+// The same without a window, waiting for it to end (a launcher's --prepare): prints "progress <0..1> <step>" lines.
+// Returns 0 when the game is ready, else the SETUP_FAIL_* state.
+int setup_prepare(const char *folder);
 int setup_state(void);         // SETUP_*
 float setup_progress(void);    // 0..1 while running
 bool setup_running(void);
