@@ -977,3 +977,37 @@ Pedido: capturar a qualquer momento da batalha, mais fácil com o selvagem fraco
   sobreposto confirma com o botão de baixo, como no Xbox (`menu.mm`). Remapeamentos da página Controles continuam valendo.
 - **Teste.** O `ini` carrega o layout (log `[input] controller layout: Nintendo with A / B swapped`) e o launcher mostra a
   opção. Os botões de um controle físico não foram apertados no teste automático (o `LARECOMP_INPUT` não passa pelo mapa).
+
+## Tela inicial: uma janela do tamanho das páginas, e redimensionável (12/11/2026)
+- **Relato.** A tela inicial tinha 0,86 da altura da tela de largura (774 px numa tela de 900), o que cortava o item
+  "Imagem e som" da barra lateral e truncava rótulos compridos. E ela não se redimensionava.
+- **Causa.** A largura vinha de uma fração da altura que não contava com a barra lateral nem com o rótulo mais longo, e a
+  janela não tem moldura, então nenhuma borda podia ser arrastada.
+- **Correção** (`runtime/ui/launcher_lg.mm`). Ela começa com 1,33 da própria altura (1197 px em 900), limitada ao
+  display, e a barra lateral fica pelo menos tão larga quanto o nome de página mais longo do idioma escolhido. Como a
+  janela não tem moldura, o teste de acerto dá as áreas de redimensionar do SDL3 à sua borda (a faixa do título continua
+  arrastando), com mínimo de 720x560. `LARECOMP_LAUNCHER_SIZE=<l>x<a>` troca o tamanho inicial para capturas
+  roteirizadas.
+- **Teste.** Conferida em 900x620, 1197x900 (o padrão) e 1400x900 nas cinco páginas.
+
+## Tela inicial: o jogo na lista do Steam (12/11/2026)
+- **Pedido.** O Steam mostrava o jogo como uma caixa cinza, e o botão Jogar abria a tela inicial em vez do jogo.
+- **Mudança** (`runtime/steam.c`, `runtime/steam.h`, `runtime/ui/launcher_lg.mm`: página Jogo, "Adicionar ao Steam"). A
+  entrada vai para a lista de atalhos do próprio Steam (`userdata/<conta>/config/shortcuts.vdf`, editada no lugar, com as
+  outras entradas mantidas byte a byte e um `shortcuts.vdf.steam-backup` feito uma vez), com as imagens em `grid/`: única
+  larga, retrato, hero, logo e ícone. O Steam precisa estar **fechado** enquanto ela escreve (ele guarda a lista na
+  memória e a reescreve ao sair) e mostra a entrada nova depois de reiniciar. O jogo então começa com `--play`.
+- **Teste.** Verificado numa cópia de uma árvore `userdata` real: a entrada entra e os atalhos existentes continuam byte a
+  byte.
+
+## Tela inicial: a entrada no Steam ia para a conta errada, e o Steam fechado era recusado (12/11/2026)
+- **Relato.** Numa instalação real com três contas, "Adicionar ao Steam" recusava mesmo com o Steam fechado, e a entrada
+  ia para a conta errada.
+- **Causa.** Duas. O teste de "o Steam está aberto" casava com qualquer processo cujo nome comece por `steam` (nesta
+  máquina, o `steamos-manager` e companhia), então recusava sempre; e a conta era a do `shortcuts.vdf` mais novo, que não
+  é necessariamente a biblioteca que o jogador vê (aqui era o arquivo de outra conta, escrito depois).
+- **Correção** (`runtime/steam.c`). O teste procura o cliente mesmo (comm `steam`). A conta vem do
+  `config/loginusers.vdf` (a de `AutoLogin "1"`), cuja pasta em `userdata/` é o SteamID64 menos 76561197960265728; ela é
+  usada quando tem pasta de `config`, e o arquivo mais novo fica como alternativa.
+- **Teste.** Contra uma cópia da árvore `userdata` real (três contas): a entrada foi para a conta de login automático e os
+  seis atalhos existentes ficaram byte a byte.
