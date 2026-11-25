@@ -12,6 +12,7 @@
 // LARECOMP_LAUNCHER_KEYS=1 opens the Controls page, =<slot> also waits for a new key for that input
 // (runtime/input_bind.h BIND_*), and <slot>:<key name> presses that key for it.
 #include <SDL3/SDL.h>
+#include <unistd.h>
 #include <float.h>
 #include <math.h>
 #include <pthread.h>
@@ -25,7 +26,9 @@
 #include "settings_ui.h"
 
 extern "C" {
+#include "../rt.h"
 #include "gamesetup.h"
+#include "steam.h"
 #include "input_bind.h"
 #include "mods.h"
 #include "paths.h"
@@ -195,6 +198,54 @@ static bool take(char *slot, char *out, size_t n) {
 
 // ------------------------------------------------------------------ the game files section
 static const ImVec4 &k_green = UI_GREEN_TEXT, &k_red = UI_RED_TEXT;
+
+// ------------------------------------------------------------------ Steam
+// A non-Steam shortcut in Steam's own list (runtime/steam.c), so the game starts from there without this window
+static int g_steam_state;  // (0 nothing yet, 1 added, 2 already there, negative: see steam.h)
+
+// The program Steam should start: the AppImage when this runs from one (its mount goes away), else this binary
+static void steam_exe(char *out, size_t n) {
+    const char *appimage = getenv("APPIMAGE");
+    if (appimage && *appimage) { snprintf(out, n, "%s", appimage); return; }
+    ssize_t k = readlink("/proc/self/exe", out, n - 1);
+    out[k > 0 ? k : 0] = 0;
+}
+
+static int steam_add_here(char *msg, size_t n) {
+    char exe[1024];
+    steam_exe(exe, sizeof exe);
+    int r = steam_add_shortcut(exe, RT_APP_NAME, "--play", msg, n);
+    fprintf(stderr, "[steam] %s: %s\n", exe, msg);
+    return r;
+}
+static void steam_section(void) {
+    ui_heading("Steam");
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextDisabled("%s", T("Puts the game in Steam's list, so it opens from there with --play and this window is only for setup.",
+                                "Coloca o jogo na lista do Steam, para abri-lo de lá com --play e deixar esta janela só para a configuração."));
+    ImGui::PopTextWrapPos();
+    if (ui_button(T("Add to Steam", "Adicionar ao Steam"), -1)) {
+        char msg[1200];
+        g_steam_state = steam_add_here(msg, sizeof msg);
+    }
+    if (g_steam_state) {
+        static const struct { int state; const char *en, *pt; } k[] = {
+            {STEAM_OK_ADDED, "Added: restart Steam and it is in your library.", "Adicionado: reinicie o Steam e ele está na sua biblioteca."},
+            {STEAM_OK_ALREADY, "Steam already has it.", "O Steam já tem ele."},
+            {STEAM_ERR_STEAM_RUNNING, "Quit Steam first, then add it (Steam writes its own list when it closes).",
+                                      "Feche o Steam antes de adicionar (o Steam grava a própria lista ao fechar)."},
+            {STEAM_ERR_NO_STEAM, "No Steam install found.", "Nenhum Steam instalado encontrado."},
+        };
+        const char *msg = NULL;
+        for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
+            if (k[i].state == g_steam_state) msg = T(k[i].en, k[i].pt);
+        ImGui::PushTextWrapPos(0);
+        if (msg) ImGui::TextColored(g_steam_state > 0 ? k_green : k_red, "%s", msg);
+        else ImGui::TextColored(k_red, "%s", T("Couldn't write Steam's shortcut list (details in lasrecomp.log).",
+                                               "Não foi possível gravar a lista de atalhos do Steam (detalhes no lasrecomp.log)."));
+        ImGui::PopTextWrapPos();
+    }
+}
 
 static void game_files_section(SDL_Window *win) {
     ui_heading(T("Game files", "Arquivos do jogo"));
@@ -383,6 +434,16 @@ static float g_drag_h, g_buttons_w;  // (logical pixels: the strip that drags th
 static SDL_HitTestResult SDLCALL launcher_hit(SDL_Window *win, const SDL_Point *pt, void *) {
     int w = 0, h = 0;
     SDL_GetWindowSize(win, &w, &h);
+    const int e = 6;  // (the resize rim, in px: the window has no frame, so its edges are the only handle)
+    bool left = pt->x < e, right = pt->x >= w - e, top = pt->y < e, bottom = pt->y >= h - e;
+    if (top && left) return SDL_HITTEST_RESIZE_TOPLEFT;
+    if (top && right) return SDL_HITTEST_RESIZE_TOPRIGHT;
+    if (bottom && left) return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+    if (bottom && right) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+    if (top) return SDL_HITTEST_RESIZE_TOP;
+    if (bottom) return SDL_HITTEST_RESIZE_BOTTOM;
+    if (left) return SDL_HITTEST_RESIZE_LEFT;
+    if (right) return SDL_HITTEST_RESIZE_RIGHT;
     return pt->y < g_drag_h && pt->x < w - g_buttons_w ? SDL_HITTEST_DRAGGABLE : SDL_HITTEST_NORMAL;
 }
 static int g_game_w = 1280, g_game_h = 720;
@@ -394,9 +455,15 @@ static void window_as_launcher(SDL_Window *win) {
     SDL_SetWindowFullscreen(win, false);
     SDL_Rect usable = {0, 0, 1920, 1040};
     SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(win), &usable);
-    int lh = usable.h * 86 / 100 < 900 ? usable.h * 86 / 100 : 900, lw = lh * 86 / 100;
+    int lh = usable.h * 86 / 100 < 900 ? usable.h * 86 / 100 : 900;
+    // (0.86 of the height - a window taller than wide - left "Wild battles (experimental)" and the sidebar's
+    // "Image and sound" cut off: the pages want a wide window, so this one starts wide and the player can resize it)
+    int lw = lh * 133 / 100;
+    if (lw > usable.w * 94 / 100) lw = usable.w * 94 / 100;
+    if (getenv("LARECOMP_LAUNCHER_SIZE")) sscanf(getenv("LARECOMP_LAUNCHER_SIZE"), "%dx%d", &lw, &lh);  // (tests)
     SDL_SetWindowBordered(win, false);
-    SDL_SetWindowResizable(win, false);
+    SDL_SetWindowResizable(win, true);
+    SDL_SetWindowMinimumSize(win, 720, 560);
     SDL_SetWindowSize(win, lw, lh);
     SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     SDL_SetWindowHitTest(win, launcher_hit, NULL);
@@ -528,6 +595,15 @@ extern "C" void launcher_lg_run(const char *root) {
         }
         last_install = inst;
         bool ready = !setup_running() && setup_ready();
+        {   // (tests, LARECOMP_ADD_STEAM=1: the Steam shortcut added, then exit - status 0 when it is there)
+            static int add = -1;
+            if (add < 0) add = getenv("LARECOMP_ADD_STEAM") != NULL;
+            if (add == 1) {
+                char msg[1200];
+                int r = steam_add_here(msg, sizeof msg);
+                exit(r >= 0 ? 0 : 1);
+            }
+        }
         {   // (tests, LARECOMP_UI2X_GENERATE=1: the 2x interface images made, then exit - status 0 when done)
             static int gen = -1;
             if (gen < 0) gen = getenv("LARECOMP_UI2X_GENERATE") != NULL;
@@ -567,6 +643,11 @@ extern "C" void launcher_lg_run(const char *root) {
         ImGui::PopStyleVar(2);
         ui_window_backdrop();
         float pad = 22 * s, side_w = 270 * s;
+        {   // the sidebar holds the page names: wide enough for the longest of them (no label gets cut off)
+            float tw = 0;
+            for (int i = 0; i < NTABS; i++) tw = fmaxf(tw, ImGui::CalcTextSize(names[i]).x);
+            side_w = fmaxf(side_w, tw + (pad + ui_inset()) * 2);
+        }
         g_drag_h = 70 * s, g_buttons_w = 120 * s;
 
         // ---- the sidebar: the icon and the name, the pages, Play
@@ -670,6 +751,7 @@ extern "C" void launcher_lg_run(const char *root) {
                          "Nintendo, A / B swapped: A bottom, B right, X and Y where Nintendo has them (for button prompt mods made that way). The button prompts follow.",
                          "Quais botões do controle são A / B e X / Y. Nintendo: A à direita, B embaixo. Xbox: A embaixo, B à direita, como as letras de um controle de Xbox. "
                          "Nintendo, A / B trocados: A embaixo, B à direita, X e Y onde a Nintendo os põe (para mods de ícones feitos assim). Os ícones dos botões acompanham."));
+                steam_section();
             } else if (tab == TAB_GRAPHICS) {
                 const char *extra[] = {T("Resolution", "Resolução"), T("Fullscreen", "Tela cheia")};
                 float x = ui_graphics_x(extra, 2);

@@ -256,3 +256,11 @@ fechado) copia o build atual para lá depois de validado. Assim, recompilar e te
 
 Para comparar áudio com o original:
 `ffmpeg -i <video>.webm -vn -f s16le -ar 48000 -ac 2 ref.raw` e correlacionar com a gravação (numpy no `.venv`).
+
+## Tela inicial e Steam
+| Variável | Efeito |
+|---|---|
+| `LARECOMP_LAUNCHER_SIZE=<l>x<a>` | tamanho inicial da janela da tela inicial (capturas roteirizadas; `runtime/ui/launcher_lg.mm`) |
+| `LARECOMP_ADD_STEAM=1` | escreve a entrada do jogo na lista do Steam e sai (status 0 quando ela está lá) |
+| `LARECOMP_STEAM_ROOT=<pasta>` | raiz do Steam a usar (teste, no lugar das três instalações usuais) |
+| `LARECOMP_STEAM_RUNNING=1` | finge o Steam aberto: a escrita da entrada é recusada (teste; `runtime/steam.c`) |
