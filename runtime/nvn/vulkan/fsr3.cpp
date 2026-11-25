@@ -15,23 +15,26 @@ extern "C" {
 #include "vk.h"
 #include "fsr3.h"
 }
+#ifdef _WIN32
 #include "ffx_api/ffx_api.h"
 #include "ffx_api/ffx_upscale.h"
 #include "ffx_api/vk/ffx_api_vk.h"
-
-#ifdef _WIN32
 #include "ffx_api/ffx_api_loader.h"
 static ffxFunctions fx;
+#else
+typedef void *ffxContext;  // (no FSR 3.1 off Windows: the DLL is the only Vulkan backend of the SDK)
 #endif
 static int loaded = -1;  // -1 not tried, 0 missing, 1 loaded
 static ffxContext ctx;
 static uint32_t ctx_rw, ctx_rh, ctx_ow, ctx_oh;
 
+#ifdef _WIN32
 static void fsr3_message(uint32_t type, const wchar_t *msg) {
     char m[512];
     snprintf(m, sizeof m, "%ls", msg);
     LOG("[fsr3] %s: %s\n", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", m);
 }
+#endif
 
 extern "C" bool fsr3_available(void) {
 #ifdef _WIN32
@@ -115,12 +118,14 @@ extern "C" void fsr3_jitter(uint32_t rw, uint32_t ow, uint64_t frame, float *jx,
 #endif
 }
 
+#ifdef _WIN32
 static FfxApiResource res(VkImage img, uint32_t fmt, uint32_t w, uint32_t h, uint32_t usage) {
     FfxApiResourceDescription d = {};
     d.type = FFX_API_RESOURCE_TYPE_TEXTURE2D, d.format = fmt, d.width = w, d.height = h, d.depth = 1, d.mipCount = 1;
     d.flags = 0, d.usage = usage;
     return ffxApiGetResourceVK((void *)img, d, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);  // (every image here: GENERAL)
 }
+#endif
 
 extern "C" bool fsr3_dispatch(VkCommandBuffer cb, const Fsr3Dispatch *in) {
 #ifdef _WIN32

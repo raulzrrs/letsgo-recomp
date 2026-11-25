@@ -124,6 +124,52 @@ void rt_paths_init(void) {
 
 const char *rt_data_root(void) { return g_root; }
 
+#ifndef _WIN32
+const char *rt_tool(const char *const *cand) {
+    for (size_t i = 0; cand[i]; i++)
+        if (!access(cand[i], X_OK)) return cand[i];
+    return cand[0];
+}
+
+static const char *installed(const char *const *cand) {
+    for (size_t i = 0; cand[i]; i++)
+        if (!access(cand[i], X_OK)) return cand[i];
+    return NULL;
+}
+
+bool rt_unzip_cmd(const char *archive, const char *dir, const char *argv[8]) {
+    static const char *const bsdtar[] = {"/usr/bin/bsdtar", "/bin/bsdtar", "/usr/local/bin/bsdtar", NULL};
+    static const char *const seven[] = {"/usr/bin/7z", "/bin/7z", "/usr/bin/7zz", "/bin/7zz", NULL};
+    static const char *const unzip_bin[] = {"/usr/bin/unzip", "/bin/unzip", NULL};
+    static const char *const python[] = {"/usr/bin/python3", "/bin/python3", "/usr/local/bin/python3", NULL};
+    static const char *const tar[] = {"/usr/bin/tar", "/bin/tar", NULL};
+    static char seven_dir[1024];
+    const char *p;
+    if ((p = installed(bsdtar))) {  // (the libarchive Windows' own tar.exe is: zip, rar, 7z and tar)
+        argv[0] = p, argv[1] = "-xf", argv[2] = archive, argv[3] = "-C", argv[4] = dir, argv[5] = NULL;
+        return true;
+    }
+    if ((p = installed(seven))) {
+        snprintf(seven_dir, sizeof seven_dir, "-o%s", dir);  // (7-Zip's output directory is glued to the flag)
+        argv[0] = p, argv[1] = "x", argv[2] = "-y", argv[3] = seven_dir, argv[4] = archive, argv[5] = NULL;
+        return true;
+    }
+    if ((p = installed(unzip_bin))) {
+        argv[0] = p, argv[1] = "-qq", argv[2] = "-o", argv[3] = archive, argv[4] = "-d", argv[5] = dir, argv[6] = NULL;
+        return true;
+    }
+    if ((p = installed(python))) {
+        argv[0] = p, argv[1] = "-m", argv[2] = "zipfile", argv[3] = "-e", argv[4] = archive, argv[5] = dir, argv[6] = NULL;
+        return true;
+    }
+    if ((p = installed(tar))) {  // (no zip; the last resort, .tar / .tgz)
+        argv[0] = p, argv[1] = "-xf", argv[2] = archive, argv[3] = "-C", argv[4] = dir, argv[5] = NULL;
+        return true;
+    }
+    return false;
+}
+#endif
+
 bool rt_resource(const char *name, const char *dev_rel, char *out, size_t n) {
     char c[4][1100] = {{0}};
     if (name) {

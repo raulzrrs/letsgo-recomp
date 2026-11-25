@@ -51,7 +51,7 @@ In the game, **F12** opens the same settings, applied at once:
 
 | | |
 |---|---|
-| OS | Windows 10 or 11, 64-bit |
+| OS | Windows 10 or 11, 64-bit; Linux x86-64, built from source ([docs/COMPILAR-LINUX.md](docs/COMPILAR-LINUX.md)) |
 | CPU | x86-64 with SSE4.2 (Intel Nehalem / AMD Bulldozer or newer); AVX2 (Intel Haswell / AMD Zen or newer) recommended: without it the game code is built for older CPUs and runs slower |
 | GPU | Vulkan 1.3 |
 | RAM | about 4 GB while playing (5.2 GB during the one-time setup) |
@@ -75,6 +75,9 @@ Most tested with *Eevee* 1.0.0; *Pikachu* 1.0.0 less.
 4. Wait while it copies the files and recompiles the game for your PC (only once: 22 minutes measured on a 20-thread CPU, longer with fewer threads).
 5. Click **Play**.
 
+On **Linux** the game is built from source instead, natively (no Wine or Proton): see
+[docs/COMPILAR-LINUX.md](docs/COMPILAR-LINUX.md). The start screen, the game and the options are the same.
+
 Everything stays in that folder (settings, saves, mods). To update, unzip a new release over it. For both games, use
 one folder each.
 
@@ -91,6 +94,8 @@ Mods of the game's code (exefs, IPS, cheats) don't work. Tested with the Brazili
 - Wild battles don't split experience yet
 - Switching to TAA while playing shows one or two black frames
 - The 2x interface shows a few frames of thin stripes during an area change
+- Linux: FSR 3.1 upscaling needs AMD's Windows DLL, so that choice falls back to FSR 1 (SMAA, TAA, FSR 1 and frame
+  generation work)
 - Online features, the Poké Ball Plus and the second player aren't supported
 
 Crashes: please open an issue with `lasrecomp.log` ([CONTRIBUTING.md](CONTRIBUTING.md)). What changed in each

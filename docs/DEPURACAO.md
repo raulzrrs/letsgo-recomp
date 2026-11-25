@@ -256,3 +256,11 @@ fechado) copia o build atual para lá depois de validado. Assim, recompilar e te
 
 Para comparar áudio com o original:
 `ffmpeg -i <video>.webm -vn -f s16le -ar 48000 -ac 2 ref.raw` e correlacionar com a gravação (numpy no `.venv`).
+
+## Linux
+| Variável | Efeito |
+|---|---|
+| `LARECOMP_CC=<programa>` | compilador da build (`Makefile`; padrão: `clang`) |
+| `LARECOMP_TAR=<programa>` | desempacotador dos mods e do upscaler de 2x (padrão: o primeiro que existir entre `bsdtar`, `7z`, `unzip`, o `zipfile` do python3 e o `tar`; `runtime/paths.c`, `rt_unzip_cmd`) |
+| `LARECOMP_NAME=<nome>` / `LARECOMP_BIN=<caminho>` | nome e programa escritos pelo `tools/steam_shortcut.sh` na entrada `.desktop` |
+| `LARECOMP_WINDOW_SHOT` / `LARECOMP_LAUNCHER_SHOT` / `LARECOMP_INPUT` | os mesmos testes roteirizados do Windows; ver [COMPILAR-LINUX.md](COMPILAR-LINUX.md) |

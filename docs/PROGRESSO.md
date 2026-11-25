@@ -4,7 +4,7 @@ Estado atual do port. A história completa, com cada problema e como foi resolvi
 [HISTORICO.md](HISTORICO.md). As ferramentas de diagnóstico estão em [DEPURACAO.md](DEPURACAO.md).
 O backlog priorizado para uma versão madura está em [ROADMAP.md](ROADMAP.md).
 
-_Atualizado em 17/10/2026._
+_Atualizado em 12/11/2026._
 
 ## O que funciona
 | Área | Estado |
@@ -14,6 +14,7 @@ _Atualizado em 17/10/2026._
 | Controle | gamepad do PC como modo portátil (seleção de controle aceita) |
 | Traduções / mods | pasta `mods/<nome>/` no formato do Atmosphere (LayeredFS): arquivos do romfs trocados ou adicionados, escolhida no launcher ("Tradução"). Testada com a tradução PT-BR de fãs (Pokémon Switch Brasil, v3.1): textos, menus e imagens em português. Instalar: botão "Instalar tradução..." do launcher com o arquivo baixado (.zip/.rar/.7z), ou copiar o `romfs` do Eevee para `mods/<nome>/romfs` |
 | Release | `LetsGoRecomp.exe` num zip (`make dist`): o jogador escolhe a pasta do jogo no launcher, que confere a v1.0.0, copia os arquivos e recompila o código do jogo no PC dele (gerador congelado + Zig); launcher em inglês ou português |
+| Linux | build nativa (ELF, sem Wine / Proton) a partir dos seus próprios arquivos: pkg-config para SDL3 / FFmpeg / Vulkan / shaderc, `make gen` pelo `.venv`, `make appimage` para o pacote único e `make steam` para a entrada no Steam. Huge pages na janela do guest, mods e upscaler desempacotados pela ferramenta do host, FSR 3.1 trocado por FSR 1 onde a DLL da AMD não existe. Guia: [COMPILAR-LINUX.md](COMPILAR-LINUX.md) |
 | Tela de toque (Brincar com o parceiro) | mouse: botão esquerdo segurado é o dedo; controle: analógico direito move um dedo (círculo na tela) e ZR segurado toca. Acariciar, abrir a bandeja de frutas e levar a fruta até a boca funcionam (testado só com controle: o Eevee comeu). Funciona em qualquer tamanho e proporção de janela |
 | Teclado e mouse | WASD anda / mira, Espaço ou Enter = A, Q ou Backspace = B, Tab = X (menu), R = Y, Z / C = L / R, `=` / `-` = Plus / Minus, setas = d-pad. Mouse: na mira da Poké Ball (depois do "Get ready") ele é preso à janela: movimento = mira (giroscópio virtual), esquerdo = arremessar; fora dela fica livre e o botão esquerdo é um dedo na tela de toque (Brincar com Eevee: acariciar); direito = B sempre. As teclas e a sensibilidade do mouse se trocam no launcher (página "Controles") |
 | Vídeo de abertura | imagem e áudio corretos, 1080p, termina e segue para o jogo |

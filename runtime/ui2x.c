@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 
 #include "hle.h"
+#include "paths.h"
 #include "platform.h"
 #include "settings.h"
 
@@ -40,10 +41,16 @@
 #define PAK "cache/ui2x.pak"
 #define WORK "cache/ui2x_work"
 #define TOOL_DIR "cache/waifu2x"
+#ifdef _WIN32
 #define TOOL_NAME "waifu2x-ncnn-vulkan-20250915-windows"
-#define TOOL_URL "https://github.com/nihui/waifu2x-ncnn-vulkan/releases/download/20250915/" TOOL_NAME ".zip"
 #define TOOL_SIZE 35497352ull
 #define TOOL_SHA256 "7425be94b94e4c8f37a1e433ac0e0100c43790e2c37418f4b65d8235adfbdc87"
+#else
+#define TOOL_NAME "waifu2x-ncnn-vulkan-20250915-linux"
+#define TOOL_SIZE 36658685ull
+#define TOOL_SHA256 "848e0fba55657d34da90b775b8139e9806dc754798b029f95e106ba8850a731f"
+#endif
+#define TOOL_URL "https://github.com/nihui/waifu2x-ncnn-vulkan/releases/download/20250915/" TOOL_NAME ".zip"
 
 static _Atomic int g_state;
 static _Atomic float g_progress;
@@ -205,16 +212,22 @@ static bool fetch_tool(void) {
     char exe[512], dir[512];
     tool_paths(exe, sizeof exe, dir, sizeof dir);
     if (is_file(exe)) return true;
-#ifdef _WIN32
     g_state = UI2X_DOWNLOADING, g_progress = 0;
     mkdir("cache", 0755);
     mkdir(TOOL_DIR, 0755);
     const char *zip = TOOL_DIR "/download.zip";
     remove(zip);
-    char curl[600], tar[600];
+    const char *curl;
+    const char *unpack[8] = {0};  // (the archive's unpacker: bsdtar / 7z / unzip / python3 / tar, whatever is here)
+#ifdef _WIN32
+    char win_curl[600];
     const char *sys = getenv("SystemRoot");
-    snprintf(curl, sizeof curl, "%s\\System32\\curl.exe", sys ? sys : "C:\\Windows");
-    snprintf(tar, sizeof tar, "%s\\System32\\tar.exe", sys ? sys : "C:\\Windows");
+    snprintf(win_curl, sizeof win_curl, "%s\\System32\\curl.exe", sys ? sys : "C:\\Windows");
+    curl = win_curl;
+#else
+    static const char *const curls[] = {"/usr/bin/curl", "/usr/local/bin/curl", "/bin/curl", NULL};
+    curl = rt_tool(curls);
+#endif
     const char *dl[] = {curl, "-fsSL", "--retry", "2", "-o", zip, TOOL_URL, NULL};
     PlatProc p = plat_spawn(dl, TOOL_DIR "/download.log", false);
     int r = -1;
@@ -228,18 +241,26 @@ static bool fetch_tool(void) {
         remove(zip);
         return false;
     }
-    const char *un[] = {tar, "-xf", zip, "-C", TOOL_DIR, NULL};
-    p = plat_spawn(un, TOOL_DIR "/unpack.log", false);
+#ifdef _WIN32
+    unpack[0] = "tar.exe", unpack[1] = "-xf", unpack[2] = zip, unpack[3] = "-C", unpack[4] = TOOL_DIR;
+    bool have = true;
+#else
+    bool have = rt_unzip_cmd(zip, TOOL_DIR, unpack);
+#endif
+    p = have ? plat_spawn(unpack, TOOL_DIR "/unpack.log", false) : 0;
     r = p ? plat_proc_wait(p, true) : -1;
     remove(zip);
-    if (r != 0 || !is_file(exe)) { LOG("[ui2x] couldn't unpack the upscaler (tar %d)\n", r); return false; }
+    if (r != 0 || !is_file(exe)) {
+        LOG("[ui2x] couldn't unpack the upscaler (%s %d): 7z, unzip or python3 unpacks the zip\n",
+            have ? unpack[0] : "no unpacker", r);
+        return false;
+    }
+#ifndef _WIN32
+    chmod(exe, 0755);  // (the zip records it; a file system without modes would not)
+#endif
     remove(TOOL_DIR "/download.log");
     remove(TOOL_DIR "/unpack.log");
     return true;
-#else
-    LOG("[ui2x] no upscaler: put waifu2x-ncnn-vulkan (nihui) in %s\n", dir);
-    return false;
-#endif
 }
 
 // ================================================================== step 2: the textures, from the game files
