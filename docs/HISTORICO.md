@@ -977,3 +977,91 @@ Pedido: capturar a qualquer momento da batalha, mais fácil com o selvagem fraco
   sobreposto confirma com o botão de baixo, como no Xbox (`menu.mm`). Remapeamentos da página Controles continuam valendo.
 - **Teste.** O `ini` carrega o layout (log `[input] controller layout: Nintendo with A / B swapped`) e o launcher mostra a
   opção. Os botões de um controle físico não foram apertados no teste automático (o `LARECOMP_INPUT` não passa pelo mapa).
+
+## Linux: a build nativa, sem Wine (12/11/2026)
+- **Relato.** O port só compilava no MSYS2; fora do Windows, nada era compilado.
+- **Causa.** As flags do SDL3, do FFmpeg, do Vulkan e do shaderc eram as do MSYS2, fixas no `Makefile`. Aos caminhos de
+  Linux de `mods.c`, `movie.c` e `linux.c` faltavam `<unistd.h>` e `<sys/stat.h>` (`rmdir`, `pread`, `stat`, e o
+  `RT_APP_NAME`, que vem do `paths.h`). O `fsr3.cpp` incluía os headers da API C do FidelityFX, que pertencem à DLL do
+  Windows, e o `pl.c` só listava as fontes que o Windows tem.
+- **Correção** (`Makefile`, `runtime/mods.c`, `runtime/hle/movie.c`, `runtime/platform/linux.c`,
+  `runtime/nvn/vulkan/fsr3.cpp`, `runtime/hle/pl.c`). As flags vêm do pkg-config (`sdl3`, `libavformat`, `libavcodec`,
+  `libavutil`, `libswscale`, `vulkan`, `shaderc`): cabeçalhos numa subpasta (Fedora: `/usr/include/ffmpeg`) e o nome do
+  shaderc (`libshaderc` no Debian, `libshaderc_shared` no Fedora) resolvem sozinhos. Os entrechos da DLL do FidelityFX
+  ficam sob `#ifdef _WIN32`. Noto Sans e Liberation Sans entram como substitutas de fonte, que é o que uma máquina
+  Fedora e as imagens imutáveis de jogos têm (sem DejaVu). Makefile, compilação e execução em
+  [COMPILAR-LINUX.md](COMPILAR-LINUX.md).
+- **Teste.** Fedora 45, x86-64, AMD RADV (RDNA2), Vulkan 1.4: `make gen` e `make -j` compilam o runtime e o código do
+  jogo, a tela inicial abre e o jogo roda. A build de Windows não muda (o `PLATFORM=windows` continua com as flags do
+  MSYS2).
+
+## Linux: mods não desempacotavam fora do Windows, e a taxa do monitor saía zero (12/11/2026)
+- **Relato.** Na página Mods, todo `.zip` / `.rar` / `.7z` baixado falhava com "couldn't unpack"; a geração de quadros em
+  "Auto" caía sempre em 60 Hz; e a imagem de tela do bug report fazia `build/`, que não existe numa raiz de dados
+  instalada.
+- **Causa.** A página Mods chamava `%SystemRoot%\System32\tar.exe`, que não existe fora do Windows. O
+  `vk_display_hz()` lia a taxa do compositor do Windows e devolvia 0 em qualquer outro sistema. A pasta da imagem era
+  criada só no caminho do Windows.
+- **Correção** (`runtime/mods.c`, `runtime/nvn/vulkan/device.c`, `runtime/ui2x.c`). O mesmo `tar` do libarchive no Linux
+  (`/usr/bin/bsdtar`; sem ele, o `tar` comum, que lê `.tar` / `.tgz` mas não `.zip` / `.rar` / `.7z`), com
+  `LARECOMP_TAR` para escolher outro, e o nome da ferramenta vai para o log. O `vk_display_hz()` lê o modo atual do
+  display pelo SDL3. A pasta da imagem é criada quando falta.
+- **Teste.** No host (Fedora 45): um `.zip` de tradução instala pela página Mods com o `bsdtar` e com o `tar` comum
+  (neste, só os `.tar` / `.tgz`); a geração de quadros em "Auto" usa a taxa do monitor e não mais 60 Hz.
+
+## FSR 3.1 é só do Windows: o menu passa a dizer o que roda (12/11/2026)
+- **Relato.** Fora do Windows, a escolha de anti-aliasing dizia FSR 3.1 e entregava FSR 1.
+- **Causa.** O backend Vulkan do FSR 3.1 é a `amd_fidelityfx_vk.dll`, da AMD; sem ela, o renderizador cai no FSR 1.
+- **Correção** (`runtime/ui/settings_ui.mm`, `runtime/nvn/vulkan/device.c`). Onde a DLL não carrega, a entrada lê
+  **FSR 1 (upscale)**, a dica diz o que ela faz, e os presets, o sharpening e o jitter do FSR 3.1 não são oferecidos.
+- **Teste.** No Fedora 45 a lista de anti-aliasing mostra FSR 1 (upscale) no lugar de FSR 3.1, e o upscale funciona;
+  no Windows a lista continua a mesma.
+
+## Linux: huge pages na janela do guest, para a importação na GPU parar de cortar o frame rate pela metade (12/11/2026)
+- **Relato.** No Linux o mundo rodava a 16,5 fps em vez de 30 (60 ms por quadro, 67 ms / 15 fps na cena de abertura), e
+  o áudio da abertura sumia a cada 170 ms.
+- **Diagnóstico.** Perfil do driver: 28 ms de tempo de kernel por `vkQueueSubmit2`, duas submissões por quadro, com
+  custo de 9 us por MB importado.
+- **Causa.** A memória global dos shaders é o heap do jogo importado para a GPU (`VK_EXT_external_memory_host`, o
+  `gmem_import` do `exec.c`). O RADV importa com `AMDGPU_GEM_USERPTR_REGISTER` e o driver amdgpu então toma o caminho
+  HMM: repercorre toda a faixa de userptr a cada submissão. Com páginas de 4 KB são 3,4 GB de entradas a percorrer por
+  submissão. O jogo alimenta o áudio da mesma volta, daí o som adiantado 14 % e as falhas a cada 170 ms.
+- **Correção** (`runtime/platform/linux.c`). A janela do guest é reservada com `MADV_HUGEPAGE`, e de novo depois de um
+  reboot que a remapeia: com páginas de 2 MB a mesma varredura cobre 512 vezes menos entradas (3,3 GB dos 3,5 GB de RSS
+  em `AnonHugePages`). A submissão cai para 2,2 ms e o quadro volta a 33 ms.
+- **Teste.** Fedora 45 / RADV (RDNA2): 30 fps no mundo, 30 fps na abertura e sem falhas de áudio; `/proc/<pid>/smaps`
+  mostra `AnonHugePages`. Não feito: importar menos do heap (shaders e vertex buffers o leem em qualquer ponto) e
+  dispensar o `USERPTR_REGISTER` (aí a importação precisa ser fixada de antemão, o que passa do `RLIMIT_MEMLOCK` de
+  2 GB desta máquina e falha).
+
+## Linux: o upscaler de 2x roda fora do Windows (12/11/2026)
+- **Relato.** "Gerar as imagens em 2x" nunca baixava no Linux: o download não acontecia.
+- **Causa.** O caminho chamava `%SystemRoot%\System32\curl.exe` e `tar.exe`.
+- **Correção** (`runtime/ui2x.c`, `runtime/paths.c`). A release leva a build de Linux da mesma tag do waifu2x (um zip com
+  o binário em modo 755); tamanho e SHA-256 se juntam ao do Windows sob `#ifdef _WIN32`, e o binário desempacotado
+  recebe `chmod 0755` quando o sistema de arquivos não carrega o modo. As ferramentas do host saem de um lugar só agora,
+  o `rt_tool()`: `curl` e `bsdtar` por caminho absoluto, porque um programa gerado é usado como veio e nunca procurado no
+  `PATH`. A página Mods usa o mesmo auxiliar.
+- **Teste.** No host: o upscaler é baixado, desempacotado e roda; 4708 de 4708 imagens convertidas em 2x.
+
+## Linux: nível de CPU da máquina, AppImage e entrada no Steam (12/11/2026)
+- **Pedido.** Usar o nível de CPU que a máquina tem, entregar um pacote único e deixar o Steam iniciar o jogo direto.
+- **Mudança** (`Makefile`, `tools/make_appimage.sh`, `tools/steam_shortcut.sh`). O `GENARCH` só usa x86-64-v3 onde o
+  `/proc/cpuinfo` tem AVX2 (no Windows é a tela inicial que escolhe por máquina; no Linux a biblioteca é compilada pela
+  máquina que a roda), e `make GENARCH=` ainda força um nível. O `make appimage` monta o runtime, o `lasgame.so`, a fonte
+  da tela inicial e o fecho de bibliotecas que o binário precisa, menos o que todo Linux tem (a glibc e o seu loader, o
+  loader do Vulkan, a pilha gráfica, o cliente smb do FFmpeg); saves e arquivos do jogo vão para
+  `$XDG_DATA_HOME/lasrecomp`, porque a pasta do AppImage é somente leitura. O `make steam` escreve um `.desktop` com
+  `--play`, sem reescrever o `shortcuts.vdf`.
+- **Teste.** O AppImage montado no Fedora 45 roda o jogo numa pasta sem a árvore de código; o `.desktop` inicia o jogo
+  pelo Steam com a opção `--play`.
+
+## Desempacotar um arquivo com a ferramenta que a máquina tiver (12/11/2026)
+- **Relato.** Numa distribuição sem o `bsdtar`, o zip do upscaler era entregue ao `tar` comum, que não lê zip: o
+  download dava certo e o desempacotamento falhava com "couldn't unpack the upscaler (tar 2)", que a tela inicial mostrava
+  como uma falha de download.
+- **Causa.** O `tar` era o único desempacotador tentado.
+- **Correção** (`runtime/paths.c` (`rt_unzip_cmd`), `runtime/ui2x.c`, `runtime/mods.c`). O primeiro desempacotador que
+  existe é o escolhido: `bsdtar` (libarchive: zip, rar, 7z), `7z`, `unzip`, o `zipfile` do python3 e, por último, o `tar`
+  comum. Os dois chamadores usam o mesmo, e a página Mods tinha o mesmo buraco.
+- **Teste.** No host, sem o `bsdtar`: o upscaler é baixado, desempacotado e roda; 4708 de 4708 imagens em 2x.

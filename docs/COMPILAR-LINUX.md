@@ -1,16 +1,16 @@
-# Building and running on Linux (native)
+# Compilar e rodar no Linux (nativo)
 
-The Linux build runs the game as a native ELF binary (no Wine, no Proton). It was built and played on Fedora 45,
-x86-64, AMD RADV (RDNA2 iGPU), Vulkan 1.4. The Windows build is unaffected by anything here.
+A build de Linux roda o jogo como um binário ELF nativo (sem Wine, sem Proton). Ela foi compilada e jogada no Fedora 45,
+x86-64, AMD RADV (iGPU RDNA2), Vulkan 1.4. A build de Windows não é afetada por nada daqui.
 
-## What you need
+## O que é preciso
 
 | | |
 |---|---|
 | GPU | Vulkan 1.3 |
-| CPU | x86-64 with SSE4.2; AVX2 recommended (the game code is built for x86-64-v3) |
-| Disk | about 5 GB for the game library, plus about 5 GB for the RomFS image built on the first setup |
-| Runtime libraries | SDL3, FFmpeg 8 (`libavformat`, `libavcodec`, `libavutil`, `libswscale`), `libvulkan`, shaderc (`libshaderc` or `libshaderc_shared`) |
+| CPU | x86-64 com SSE4.2; AVX2 recomendado (o código do jogo é compilado para x86-64-v3) |
+| Disco | cerca de 5 GB para a biblioteca do jogo, mais cerca de 5 GB para a imagem RomFS montada na primeira configuração |
+| Bibliotecas | SDL3, FFmpeg 8 (`libavformat`, `libavcodec`, `libavutil`, `libswscale`), `libvulkan`, shaderc (`libshaderc` ou `libshaderc_shared`) |
 
 Fedora 45:
 
@@ -18,107 +18,111 @@ Fedora 45:
 sudo dnf install clang lld make git python3 SDL3-devel ffmpeg-free-devel \
     vulkan-loader-devel vulkan-headers libshaderc-devel dejavu-sans-fonts
 
-# Fedora has no VulkanMemoryAllocator package: put its header where the build finds it
+# o Fedora não tem pacote do VulkanMemoryAllocator: põe o header onde a build o encontra
 sudo mkdir -p /usr/include/vma
 sudo curl -L -o /usr/include/vma/vk_mem_alloc.h \
     https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/v3.5.0/include/vk_mem_alloc.h
 ```
 
-Debian / Ubuntu: the same packages (`libsdl3-dev`, `libavformat-dev`, ..., `libvulkan-memory-allocator-dev`,
-`fonts-dejavu-core`). `vulkan-memory-allocator-dev` provides `<vk_mem_alloc.h>` directly.
+Debian / Ubuntu: os mesmos pacotes (`libsdl3-dev`, `libavformat-dev`, ..., `libvulkan-memory-allocator-dev`,
+`fonts-dejavu-core`). O `vulkan-memory-allocator-dev` já entrega o `<vk_mem_alloc.h>`.
 
-The compiler and linker flags come from pkg-config (`sdl3`, `libavformat`, `libavcodec`, `libavutil`, `libswscale`,
-`vulkan`, `shaderc`), so a distribution that keeps FFmpeg's headers in a subdirectory (Fedora:
-`/usr/include/ffmpeg`) needs no extra flags.
+As flags do compilador e do linker vêm do pkg-config (`sdl3`, `libavformat`, `libavcodec`, `libavutil`, `libswscale`,
+`vulkan`, `shaderc`), então uma distribuição que guarda os headers do FFmpeg num subdiretório (Fedora:
+`/usr/include/ffmpeg`) não precisa de flag extra.
 
-## Build
+## Compilar
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install unicorn capstone lz4    # the generator (tools/gen.py)
+.venv/bin/pip install unicorn capstone lz4    # o gerador (tools/gen.py)
 make gen                                      # extracted/exefs  ->  generated/
-make -j$(nproc)                               # build/lasrecomp and build/lasgame.so
+make -j$(nproc)                               # build/lasrecomp e build/lasgame.so
 ```
 
-`make gen` translates your own game files (`extracted/exefs`) into C. It takes about a minute per module. The Windows
-release ships the same generator frozen as `lasgen`; on Linux it runs from `.venv`.
+O `make gen` traduz os seus próprios arquivos do jogo (`extracted/exefs`) para C. Leva cerca de um minuto por módulo. A
+release de Windows leva o mesmo gerador congelado como `lasgen`; no Linux ele roda do `.venv`.
 
-The game code is built for this machine's CPU level: x86-64-v3 (AVX2) where `/proc/cpuinfo` has it, x86-64-v2
-otherwise (`make GENARCH=-march=x86-64-v3` forces one). `make CC=... CXX=...` and `LARECOMP_CC` pick another compiler.
+O código do jogo é compilado para o nível de CPU desta máquina: x86-64-v3 (AVX2) onde o `/proc/cpuinfo` o tem, x86-64-v2
+caso contrário (`make GENARCH=-march=x86-64-v3` força um). `make CC=... CXX=...` e `LARECOMP_CC` escolhem outro
+compilador.
 
-`make -j` then builds two things: `build/lasrecomp` (the runtime: window, input, Vulkan renderer, system services)
-and `build/lasgame.so` (the game code, ~900 C files, about 35 minutes on 16 threads). Only the first build is that
-slow; changing runtime files rebuilds just those.
+O `make -j` compila duas coisas: `build/lasrecomp` (o runtime: janela, entrada, renderizador Vulkan, serviços do
+sistema) e `build/lasgame.so` (o código do jogo, ~900 arquivos C, cerca de 35 minutos em 16 threads). Só a primeira
+build leva esse tempo; mudar arquivos do runtime recompila só eles.
 
-## Run
+## Rodar
 
 ```bash
-./build/lasrecomp                      # the start screen: pick the game folder there
-./build/lasrecomp extracted --play     # straight into the game
+./build/lasrecomp                      # a tela inicial: escolha ali a pasta do jogo
+./build/lasrecomp extracted --play     # direto no jogo
 ```
 
-The game folder is the one holding `exefs/` and `romfs/`. The first setup copies (hard-links, where the file system
-allows) the game files into the data root and writes `romfs.bin` from `romfs/`: about 4.5 GB, a few minutes. Saves,
-settings (`larecomp.ini`), shader caches and mods stay in the data root.
+A pasta do jogo é a que tem `exefs/` e `romfs/`. A primeira configuração copia (por hard link, onde o sistema de
+arquivos permite) os arquivos do jogo para a raiz de dados e escreve o `romfs.bin` a partir de `romfs/`: cerca de 4,5 GB,
+alguns minutos. Saves, opções (`larecomp.ini`), caches de shader e mods ficam na raiz de dados.
 
-To run it without the source tree, copy these three files into one folder and start the binary there:
+Para rodar sem a árvore de código, copie estes três arquivos para uma pasta e inicie o binário por ali:
 
 ```bash
 cp build/lasrecomp build/lasgame.so build/lasgame.so.id ~/letsgo/
 ~/letsgo/lasrecomp ~/lets_go_eevee --play
 ```
 
-`lasgame.so.id` is what tells the runtime that the library was built from the same generator and flags; without it
-(or with another id) the start screen wants to recompile the game code. That recompile works from a source checkout:
-it runs `.venv/bin/python tools/gen.py` and `/usr/bin/clang` (or `LARECOMP_CC`, or the release's Zig on Windows).
+O `lasgame.so.id` é o que diz ao runtime que a biblioteca foi compilada com o mesmo gerador e as mesmas flags; sem ele
+(ou com outro id) a tela inicial pede para recompilar o código do jogo. Essa recompilação funciona a partir de um
+checkout do código: ela roda o `.venv/bin/python tools/gen.py` e o `/usr/bin/clang` (ou o `LARECOMP_CC`, ou o Zig da
+release no Windows).
 
 ## AppImage
 
 ```bash
-make appimage        # tools/make_appimage.sh: build/LetsGoRecomp-<version>-x86_64.AppImage
+make appimage        # tools/make_appimage.sh: build/LetsGoRecomp-<versão>-x86_64.AppImage
 ```
 
-It carries the runtime, `lasgame.so`, the start screen's font and the SDL3 / FFmpeg / shaderc libraries it links. The
-Vulkan loader and driver stay the system's (as with the Windows build's `vulkan-1.dll`), and so does the shared font.
-The AppImage's own folder is read-only, so saves, settings, mods and the game files go to
-`$XDG_DATA_HOME/lasrecomp`. Portability is the libc of the machine that builds it: one made on Fedora 45 needs
-Fedora 45's glibc or newer.
+Ele carrega o runtime, o `lasgame.so`, a fonte da tela inicial e as bibliotecas SDL3 / FFmpeg / shaderc que o binário
+liga. O loader e o driver do Vulkan continuam os do sistema (como o `vulkan-1.dll` da build de Windows), e a fonte
+compartilhada também. A pasta do próprio AppImage é somente leitura, então saves, opções, mods e os arquivos do jogo vão
+para `$XDG_DATA_HOME/lasrecomp`. A portabilidade é a libc da máquina que o monta: um feito no Fedora 45 precisa da
+glibc do Fedora 45 ou mais nova.
 
 ## Steam
 
-`make steam` writes `~/.local/share/applications/letsgo-recomp.desktop` with `--play` in it, and prints the two clicks
-left in Steam (*Games → Add a Non-Steam Game… → Browse* to the binary). The start screen is then only for setup, and
-Steam's Play button starts the game. `tools/steam_shortcut.sh --remove` removes the entry file.
+O `make steam` escreve `~/.local/share/applications/letsgo-recomp.desktop` com `--play` nele e imprime os dois cliques
+que faltam no Steam (*Jogos → Adicionar um jogo não Steam… → Procurar* até o binário). A tela inicial fica então só
+para a configuração, e o botão Jogar do Steam inicia o jogo. `tools/steam_shortcut.sh --remove` apaga o arquivo da
+entrada.
 
-`--play` needs the game folder the start screen set up in the data root (`extracted/`), which is why the entry carries
-no path: it cannot go stale. An AppImage can be added to Steam the same way; give it the launch option `--play`.
+O `--play` precisa da pasta do jogo que a tela inicial configurou na raiz de dados (`extracted/`), e é por isso que a
+entrada não leva caminho: ele não fica velho. Um AppImage pode ser adicionado ao Steam do mesmo jeito; dê a ele a opção
+de inicialização `--play`.
 
-## Linux notes
+## Notas do Linux
 
-- **FSR 3.1 upscaling is Windows only** (AMD ships that Vulkan backend as a DLL, `amd_fidelityfx_vk.dll`). Where the
-  DLL is not there, the anti-aliasing choice reads **FSR 1 (upscale)** instead of **FSR 3.1** and does what it says; the
-  FSR 3.1 presets and sharpening are not offered then. SMAA, TAA, SSAO, GI, FSR 1 and the in-house 2x / 3x / 4x frame
-  generation all work.
-- **Mods** installed from a downloaded archive (the start screen's Mods page) are unpacked with libarchive's `tar`.
-  Windows has it as `tar.exe`; on Linux install `bsdtar` (Fedora: `bsdtar`, Debian / Ubuntu: `libarchive-tools`). A
-  plain `tar` is used when `bsdtar` is missing, which reads `.tar` / `.tgz` but not `.zip` / `.rar` / `.7z`.
-  `LARECOMP_TAR=<program>` picks another.
-- **Huge pages:** the guest window is claimed with `MADV_HUGEPAGE`. The shader global memory is the game's heap
-  imported for the GPU, and the amdgpu driver re-walks that whole userptr range on every command submission: 28 ms per
-  submission with 4 KB pages (16.5 fps instead of 30, and the intro's audio dropped out every 170 ms), 2.2 ms with 2 MB
-  pages. `/proc/<pid>/smaps` shows the 3.3 GB in `AnonHugePages`; without it, look here first.
-- **Frame generation** paces without the display's vertical-blank grid (that timing is Windows' compositor's): each
-  image is shown when it is due, which on a 240 Hz panel can space two of them one refresh instead of two apart.
-- **Fonts:** the game's font engine needs a TrueType font as a stand-in for the console's system fonts. In order:
-  `LARECOMP_FONT=<file>`, a dump in `fonts/` in the data root, then common system paths (DejaVu Sans, Noto Sans,
-  Liberation Sans, Hiragino, Yu Gothic). Without any of those the game stops at boot with
-  `FATAL: no usable system font substitute`. Do not point it at Noto Sans CJK: those are CFF outlines and the game's
-  font engine crashes on them.
-- **Audio, controllers, keyboard and mouse** go through SDL3, so PipeWire / PulseAudio and evdev / udev work as for
-  any other SDL3 game. `LARECOMP_NO_AUDIO=1` silences it.
-- **Software Vulkan (llvmpipe) cannot present to an Xvfb display**: the run stops with `FATAL: no graphics+present
-  queue`. Use a real display, or a real GPU with Xvfb.
-- **Screenshots for bug reports**: `LARECOMP_LAUNCHER_SHOT=<frame>` writes `build/launcher.png` and exits;
-  `LARECOMP_WINDOW_SHOT=<frame> LARECOMP_EXIT_AFTER_SHOT=1` writes `build/window.png`. Scripted input:
-  `LARECOMP_INPUT="<frame>:<BUTTON>:<frames>,..."` with `LARECOMP_NO_USER_INPUT=1`.
-- Crash logs go to `lasrecomp.log` in the data root, the same as on Windows (`docs/DEPURACAO.md`).
+- **O upscaling FSR 3.1 é só do Windows** (a AMD entrega esse backend Vulkan como DLL, `amd_fidelityfx_vk.dll`). Onde a
+  DLL não está, a escolha de anti-aliasing lê **FSR 1 (upscale)** no lugar de **FSR 3.1** e faz o que diz; os presets e
+  o sharpening do FSR 3.1 não são oferecidos ali. SMAA, TAA, SSAO, GI, FSR 1 e a geração de quadros própria (2x / 3x /
+  4x) funcionam.
+- **Mods** instalados de um arquivo baixado (página Mods da tela inicial) são desempacotados com o `tar` do libarchive.
+  O Windows o tem como `tar.exe`; no Linux instale o `bsdtar` (Fedora: `bsdtar`, Debian / Ubuntu: `libarchive-tools`).
+  Um `tar` comum é usado quando falta o `bsdtar`, e ele lê `.tar` / `.tgz`, mas não `.zip` / `.rar` / `.7z`.
+  `LARECOMP_TAR=<programa>` escolhe outro.
+- **Huge pages:** a janela do guest é reservada com `MADV_HUGEPAGE`. A memória global dos shaders é o heap do jogo
+  importado para a GPU, e o driver amdgpu repercorre toda essa faixa de userptr a cada submissão de comando: 28 ms por
+  submissão com páginas de 4 KB (16,5 fps em vez de 30, e o áudio da abertura sumia a cada 170 ms), 2,2 ms com páginas
+  de 2 MB. O `/proc/<pid>/smaps` mostra os 3,3 GB em `AnonHugePages`; sem isso, comece a investigar por aqui.
+- **Geração de quadros** anda sem a grade do vertical blank do monitor (essa marcação é do compositor do Windows): cada
+  imagem aparece quando é devida, o que num painel de 240 Hz pode espaçar duas delas um refresh em vez de dois.
+- **Fontes:** o motor de fontes do jogo precisa de uma fonte TrueType no lugar das fontes do sistema do console. Na
+  ordem: `LARECOMP_FONT=<arquivo>`, um dump em `fonts/` na raiz de dados, depois os caminhos comuns do sistema (DejaVu
+  Sans, Noto Sans, Liberation Sans, Hiragino, Yu Gothic). Sem nenhuma delas o jogo para no boot com
+  `FATAL: no usable system font substitute`. Não aponte para a Noto Sans CJK: são contornos CFF e o motor de fontes do
+  jogo cai com elas.
+- **Áudio, controles, teclado e mouse** passam pelo SDL3, então PipeWire / PulseAudio e evdev / udev funcionam como em
+  qualquer outro jogo SDL3. `LARECOMP_NO_AUDIO=1` silencia.
+- **Vulkan por software (llvmpipe) não apresenta num display Xvfb**: a execução para com `FATAL: no graphics+present
+  queue`. Use um display de verdade, ou uma GPU de verdade com Xvfb.
+- **Imagens para relatos de bug**: `LARECOMP_LAUNCHER_SHOT=<quadro>` grava `build/launcher.png` e sai;
+  `LARECOMP_WINDOW_SHOT=<quadro> LARECOMP_EXIT_AFTER_SHOT=1` grava `build/window.png`. Entrada roteirizada:
+  `LARECOMP_INPUT="<quadro>:<BOTAO>:<quadros>,..."` com `LARECOMP_NO_USER_INPUT=1`.
+- Os logs de crash vão para `lasrecomp.log` na raiz de dados, o mesmo do Windows (`docs/DEPURACAO.md`).
